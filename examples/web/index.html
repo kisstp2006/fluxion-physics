@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fluxion Physics in the browser</title>
+<style>
+  body { font: 14px/1.4 system-ui, sans-serif; margin: 2rem; color: #222; background: #f6f6f6; }
+  canvas { border: 1px solid #999; display: block; margin: 1rem 0; background: #fff; }
+  code { background: #eee; padding: 0 .3em; }
+  button { margin-right: .5rem; }
+</style>
+</head>
+<body>
+<h1>Fluxion Physics, with no threads at all</h1>
+<p>
+  The same solver as the native demo, compiled to <code>wasm32-freestanding</code>.
+  There is no <code>Io</code>, so there are no workers: each animation frame calls
+  <code>tick()</code>, which runs one fixed step on this thread, and then reads the
+  shapes straight out of wasm memory to draw them.
+</p>
+<p>
+  <button id="restart">Restart</button>
+  <button id="shake">Shake</button>
+  <label>Bodies <input id="count" type="number" min="10" max="2000" value="300" style="width:5em"></label>
+</p>
+<canvas id="scene" width="800" height="500"></canvas>
+<p id="status">loading…</p>
+
+<script type="module">
+  const canvas = document.getElementById("scene");
+  const ctx = canvas.getContext("2d");
+  const status = document.getElementById("status");
+  const count = document.getElementById("count");
+
+  const { instance } = await WebAssembly.instantiateStreaming(fetch("fluxion-physics-web.wasm"), {});
+  const wasm = instance.exports;
+
+  let frames = 0, startedAt = 0, bodies = 0;
+
+  function restart() {
+    bodies = wasm.start(canvas.width, canvas.height, Number(count.value));
+    frames = 0;
+    startedAt = performance.now();
+  }
+
+  function frame() {
+    const before = performance.now();
+    const touching = wasm.tick();
+    const stepMs = performance.now() - before;
+    frames += 1;
+
+    const n = wasm.shapes();
+    const len = wasm.recordLen();
+    const rec = new Float32Array(wasm.memory.buffer, wasm.recordsPtr(), n * len);
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.strokeStyle = "#1a4a8a";
+    ctx.fillStyle = "#dbe7f7";
+    for (let i = 0; i < n; i++) {
+      const r = rec.subarray(i * len, (i + 1) * len);
+      ctx.beginPath();
+      if (r[0] === 0) {
+        ctx.arc(r[1], r[2], r[4], 0, Math.PI * 2);
+        // A spoke, so a rolling ball is seen to roll.
+        ctx.moveTo(r[1], r[2]);
+        ctx.lineTo(r[1] + Math.cos(r[3]) * r[4], r[2] + Math.sin(r[3]) * r[4]);
+      } else {
+        const c = Math.cos(r[3]), s = Math.sin(r[3]);
+        for (let k = 0; k < r[4]; k++) {
+          const x = r[5 + k * 2], y = r[6 + k * 2];
+          const wx = r[1] + c * x - s * y, wy = r[2] + s * x + c * y;
+          if (k === 0) ctx.moveTo(wx, wy); else ctx.lineTo(wx, wy);
+        }
+        ctx.closePath();
+      }
+      ctx.fill();
+      ctx.stroke();
+    }
+
+    status.textContent =
+      `${bodies} bodies, ${touching} touching, step ${stepMs.toFixed(2)} ms, ` +
+      `${wasm.workers()} workers, ${(frames / ((performance.now() - startedAt) / 1000)).toFixed(0)} fps`;
+    requestAnimationFrame(frame);
+  }
+
+  document.getElementById("restart").addEventListener("click", restart);
+  document.getElementById("shake").addEventListener("click", () => wasm.shake());
+  restart();
+  requestAnimationFrame(frame);
+</script>
+</body>
+</html>

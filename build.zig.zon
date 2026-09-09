@@ -1,0 +1,48 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
+.{
+    .name = .fluxion_physics,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0xc22dc0eeaedc8b76,
+    .dependencies = .{
+        // `Vec2`, and the arithmetic on it. A rigid body is a position, a
+        // velocity and a force, and every one of those is this type.
+        //
+        // **Pinned rather than a path, and it has to be.** A body's position
+        // is handed to the engine as a `math.Vec2`, and the engine's own copy
+        // of that type is the one `fluxion-rhi` pins. A package is identified
+        // by where it came from: a path here and a pin there would be two
+        // copies of one library, and the compiler would say "expected type
+        // 'vec.Vec2', found 'vec.Vec2'". Every package that names
+        // `fluxion-math` names this commit.
+        .fluxion_math = .{
+            .url = "git+https://github.com/kisstp2006/fluxion-math#92afdbddbf930369265d24136402c7eb5dd8f70e",
+            .hash = "fluxion_math-0.1.0-dfpZBeNUBAAwUMriLKaOTRBWGFmfY53_jyYuMUxkPYek",
+        },
+
+        // What a step runs on: every core the machine has, or none at all in
+        // a browser. Pinned to the same commit `fluxion-ecs` pins, so the
+        // scheduler an engine already owns is the one this package takes.
+        .fluxion_jobs = .{
+            .url = "git+https://github.com/kisstp2006/fluxion-jobs#e064fb3129f9324b139d7ecbcf75cbd99787dad9",
+            .hash = "fluxion_jobs-0.1.0-FBQYG6HWAAD3RZ_geJ6O5O0UmfH666aT_-DuMCVqJiN1",
+        },
+
+        // Generational handles: what a body and a shape are known by, so a
+        // game holding one to a body that has been destroyed finds nothing
+        // rather than whatever took its slot.
+        .fluxion_id = .{
+            .url = "git+https://github.com/kisstp2006/fluxion-id#64a04a156031a5d87ead8ce9d4fdb8c78f21ef30",
+            .hash = "fluxion_id-0.1.0--9Hv-nGFAQAW36SvJvMB6L1nUNErZzh7JC0-nRPlrotw",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "examples",
+        "README.md",
+        "LICENSE",
+    },
+}
