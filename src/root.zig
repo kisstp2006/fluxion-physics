@@ -2,9 +2,10 @@
 
 //! Fluxion Physics - rigid bodies in a plane, on every core or on none.
 //!
-//!   `World`       the bodies, the shapes on them, and one step of time
+//!   `World`       the bodies, the shapes and joints, and one step of time
 //!   `Body`        a rigid body: where it is, how it moves, what it weighs
 //!   `shape`       circles and convex polygons, materials and filters
+//!   `joint`       hinges, sliders, rods, ropes, springs, welds, wheels
 //!   `collide`     where two shapes touch, and how deep
 //!   `broadphase`  which pairs are close enough to ask
 //!   `contact`     a contact as the solver sees it
@@ -21,6 +22,10 @@
 //! _ = try world.addShape(ground, .box(1000, 10));
 //! const ball = try world.createBody(.{ .position = .init(0, 0) });
 //! _ = try world.addShape(ball, .circle(20));
+//!
+//! // Hung from a pin two hundred pixels up, on a rod.
+//! const pin = try world.createBody(.{ .type = .static, .position = .init(0, -200) });
+//! _ = try world.createJoint(.{ .distance = .{ .body_a = pin, .body_b = ball, .anchor_a = .init(0, -200), .anchor_b = .zero } });
 //!
 //! try world.step(1.0 / 60.0, &jobs);
 //! ```

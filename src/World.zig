@@ -16,7 +16,7 @@
 //! const where = world.body(crate).?.position();
 //! ```
 //!
-//! **A step is twelve phases**, and seven of them run on every core:
+//! **A step is thirteen phases**, and eight of them run on every core:
 //!
 //! | Phase | What | On |
 //! | --- | --- | --- |
@@ -29,9 +29,10 @@
 //! | prepare joints | lever arms, masses, springs | every core |
 //! | colour | contacts and joints into runs that share no body | one |
 //! | solve | warm start, then the passes: joints, then contacts | every core, per colour |
-//! | integrate positions | move, turn, rebuild transforms, time the still | every core |
+//! | push | sunk-in bodies pushed apart, on a velocity that is then forgotten | every core, per colour |
+//! | integrate positions | move, turn, rebuild transforms | every core |
 //! | remember | impulses for next step, begin and end events | one |
-//! | sleep | islands: which rest, which wake | one |
+//! | sleep | who has been still, and which islands rest or wake | one |
 //!
 //! With a scheduler that has no workers - a browser - the same phases run
 //! on the calling thread in the same order. Nothing is compiled out.
@@ -117,6 +118,15 @@ pub const Settings = struct {
     /// keeps a body that was placed inside another from leaving at the
     /// speed of a bullet, which is what an unbounded Baumgarte term does.
     max_push_speed: f32 = 3,
+    /// How a rigid joint takes back the little it drifts: the way a spring
+    /// would that rang this many times a second, damped this many times
+    /// past the point of bouncing. Stiff enough that nobody sees the give,
+    /// and a spring rather than a fixed fraction per step because the
+    /// fraction, fed back as speed, pumps energy into a light chain holding
+    /// a heavy weight. Zero hertz holds joints rigid and lets them drift.
+    /// See `joint`.
+    joint_hertz: f32 = 60,
+    joint_damping_ratio: f32 = 2,
     /// Whether anything sleeps at all. Turning it off wakes what sleeps.
     enable_sleep: bool = true,
     /// Slower than this counts as still. Metres per second, of the body's
@@ -608,7 +618,10 @@ pub fn step(self: *World, dt: f32, jobs: *Jobs) Error!void {
         .joint = .{
             .dt = dt,
             .inv_dt = 1 / dt,
-            .baumgarte = self.settings.baumgarte,
+            .stiffness = if (self.settings.joint_hertz > 0)
+                .of(.{ .hertz = self.settings.joint_hertz, .damping_ratio = self.settings.joint_damping_ratio }, dt)
+            else
+                .baumgarte(0, 1 / dt),
             .max_push = self.settings.max_push_speed * units,
             .slop = self.settings.linear_slop * units,
             .units_per_metre = units,

@@ -5,9 +5,11 @@
 <title>Fluxion Physics in the browser</title>
 <style>
   body { font: 14px/1.4 system-ui, sans-serif; margin: 2rem; color: #222; background: #f6f6f6; }
-  canvas { border: 1px solid #999; display: block; margin: 1rem 0; background: #fff; }
+  canvas { border: 1px solid #999; display: block; margin: 1rem 0; background: #fff; cursor: grab; touch-action: none; }
+  canvas.holding { cursor: grabbing; }
   code { background: #eee; padding: 0 .3em; }
   button { margin-right: .5rem; }
+  .key { display: inline-block; border: 1px solid #999; border-radius: 3px; padding: 0 .35em; font-size: 12px; background: #fff; }
 </style>
 </head>
 <body>
@@ -16,12 +18,18 @@
   The same solver as the native demo, compiled to <code>wasm32-freestanding</code>.
   There is no <code>Io</code>, so there are no workers: each animation frame calls
   <code>tick()</code>, which runs one fixed step on this thread, and then reads the
-  shapes straight out of wasm memory to draw them.
+  shapes and joints straight out of wasm memory to draw them.
 </p>
 <p>
-  <button id="restart">Restart</button>
+  Drag anything with the pointer. In the yard of joints, <span class="key">&larr;</span>
+  <span class="key">&rarr;</span> drive the car. Bodies that have come to rest fall
+  asleep and turn grey; a step skips them until something disturbs them.
+</p>
+<p>
+  <button id="heap">Heap</button>
+  <button id="joints">Joints</button>
   <button id="shake">Shake</button>
-  <label>Bodies <input id="count" type="number" min="10" max="2000" value="300" style="width:5em"></label>
+  <label>Bodies in the heap <input id="count" type="number" min="10" max="2000" value="300" style="width:5em"></label>
 </p>
 <canvas id="scene" width="800" height="500"></canvas>
 <p id="status">loading…</p>
@@ -35,13 +43,46 @@
   const { instance } = await WebAssembly.instantiateStreaming(fetch("fluxion-physics-web.wasm"), {});
   const wasm = instance.exports;
 
-  let frames = 0, startedAt = 0, bodies = 0;
+  let frames = 0, startedAt = 0, bodies = 0, scene = "joints";
 
-  function restart() {
-    bodies = wasm.start(canvas.width, canvas.height, Number(count.value));
+  function restart(which) {
+    scene = which;
+    bodies = which === "heap"
+      ? wasm.start(canvas.width, canvas.height, Number(count.value))
+      : wasm.startJoints(canvas.width, canvas.height);
     frames = 0;
     startedAt = performance.now();
   }
+
+  // Where the pointer is, in the canvas's own pixels whatever its CSS size.
+  function at(event) {
+    const box = canvas.getBoundingClientRect();
+    return [
+      (event.clientX - box.left) * canvas.width / box.width,
+      (event.clientY - box.top) * canvas.height / box.height,
+    ];
+  }
+  canvas.addEventListener("pointerdown", (e) => {
+    if (wasm.grab(...at(e))) {
+      canvas.setPointerCapture(e.pointerId);
+      canvas.classList.add("holding");
+    }
+  });
+  canvas.addEventListener("pointermove", (e) => wasm.drag(...at(e)));
+  const letGo = () => { wasm.release(); canvas.classList.remove("holding"); };
+  canvas.addEventListener("pointerup", letGo);
+  canvas.addEventListener("pointercancel", letGo);
+
+  const held = new Set();
+  const throttle = () => wasm.drive((held.has("ArrowRight") ? 14 : 0) - (held.has("ArrowLeft") ? 14 : 0));
+  addEventListener("keydown", (e) => {
+    if (e.key === "ArrowLeft" || e.key === "ArrowRight") { held.add(e.key); throttle(); e.preventDefault(); }
+  });
+  addEventListener("keyup", (e) => { held.delete(e.key); throttle(); });
+
+  // Awake, asleep, scenery.
+  const fills = ["#e4e4e4", "#dbe7f7", "#c9c2b2"];
+  const strokes = ["#9a9a9a", "#1a4a8a", "#6d6454"];
 
   function frame() {
     const before = performance.now();
@@ -54,8 +95,6 @@
     const rec = new Float32Array(wasm.memory.buffer, wasm.recordsPtr(), n * len);
 
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.strokeStyle = "#1a4a8a";
-    ctx.fillStyle = "#dbe7f7";
     for (let i = 0; i < n; i++) {
       const r = rec.subarray(i * len, (i + 1) * len);
       ctx.beginPath();
@@ -73,19 +112,40 @@
         }
         ctx.closePath();
       }
+      ctx.fillStyle = fills[r[21]];
+      ctx.strokeStyle = strokes[r[21]];
       ctx.fill();
       ctx.stroke();
     }
 
+    // Joints: a line between their anchors. The pointer's is dashed.
+    const jn = wasm.joints();
+    const jlen = wasm.jointRecordLen();
+    const jrec = new Float32Array(wasm.memory.buffer, wasm.jointRecordsPtr(), jn * jlen);
+    for (let i = 0; i < jn; i++) {
+      const r = jrec.subarray(i * jlen, (i + 1) * jlen);
+      const mouse = r[0] === 4;
+      ctx.setLineDash(mouse ? [4, 4] : []);
+      ctx.strokeStyle = mouse ? "#c0392b" : "#2e7d32";
+      ctx.beginPath();
+      ctx.moveTo(r[1], r[2]);
+      ctx.lineTo(r[3], r[4]);
+      ctx.stroke();
+      ctx.fillStyle = ctx.strokeStyle;
+      ctx.fillRect(r[3] - 1.5, r[4] - 1.5, 3, 3);
+    }
+    ctx.setLineDash([]);
+
     status.textContent =
-      `${bodies} bodies, ${touching} touching, step ${stepMs.toFixed(2)} ms, ` +
+      `${bodies} bodies, ${wasm.awake()} awake, ${touching} touching, step ${stepMs.toFixed(2)} ms, ` +
       `${wasm.workers()} workers, ${(frames / ((performance.now() - startedAt) / 1000)).toFixed(0)} fps`;
     requestAnimationFrame(frame);
   }
 
-  document.getElementById("restart").addEventListener("click", restart);
+  document.getElementById("heap").addEventListener("click", () => restart("heap"));
+  document.getElementById("joints").addEventListener("click", () => restart("joints"));
   document.getElementById("shake").addEventListener("click", () => wasm.shake());
-  restart();
+  restart("joints");
   requestAnimationFrame(frame);
 </script>
 </body>

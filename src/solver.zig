@@ -34,6 +34,12 @@
 //! more contacts than that - the bottom of a huge pile - forces a new
 //! colour for each, and a colour with one contact in it is a join for
 //! nothing. Those go in an overflow bucket the main thread walks alone.
+//!
+//! **Joints are coloured the same way, apart.** They get a colouring of
+//! their own, and every pass solves the joints colour by colour and then
+//! the contacts. One colouring for both would save a join or two per pass;
+//! two keep a contact's hot loop free of any question about what kind of
+//! thing it is solving.
 
 const std = @import("std");
 const testing = std.testing;

@@ -50,11 +50,14 @@
 //! colour by colour and then the contacts. The answer does not depend on
 //! how many cores there are, for the same reason the contacts' does not.
 //!
-//! **Drift is fed back as a velocity**, the way a contact's penetration is -
-//! Baumgarte's fraction per step, never faster than `Settings.max_push_speed`
-//! - because this package has no position pass. A long chain under a heavy
-//! load stretches a little and comes back; Box2D's position pass would hold
-//! it tighter, and is what to add if that is ever not good enough.
+//! **Drift is taken back the way a stiff spring would take it back**,
+//! heavily damped, because this package has no position pass and the
+//! plainer way - a fixed fraction of the drift, fed back as a velocity -
+//! pumps energy into a light chain holding a heavy weight until it flies
+//! apart. `Step.rigid` has the measurements and the arithmetic;
+//! `Settings.joint_hertz` the knob. A long chain under a heavy load
+//! stretches a little and comes back; Box2D's position pass would hold it
+//! tighter, and is what to add if that is ever not good enough.
 //!
 //! **Springs are soft constraints**, Erin Catto's trick ("Soft Step", 2011,
 //! and Box2D since): a spring of a given frequency and damping ratio is a
@@ -431,8 +434,8 @@ pub const Ref = struct {
 pub const Step = struct {
     dt: f32,
     inv_dt: f32,
-    /// See `Settings.baumgarte`.
-    baumgarte: f32,
+    /// How every rigid constraint takes back its drift. See `rigid`.
+    stiffness: Softness,
     /// The fastest a drifted joint is pulled back, in world units per
     /// second. See `Settings.max_push_speed`.
     max_push: f32,
@@ -441,36 +444,62 @@ pub const Step = struct {
     /// For the mouse joint's default force.
     units_per_metre: f32,
 
-    /// The velocity asked for to close a rigid constraint's error `c`: a
-    /// fraction per step, and no faster than `max_push`.
-    fn pushBack(self: Step, c: f32) f32 {
-        return std.math.clamp(self.baumgarte * self.inv_dt * c, -self.max_push, self.max_push);
+    /// The impulse a rigid constraint along one line asks for this pass:
+    /// `mass` is its effective mass, `cdot` how fast it is being broken, `c`
+    /// by how much it already is, and `total` what it has pushed so far.
+    ///
+    /// **Rigid, but with a spring's damping in how it takes back drift.**
+    /// The plain way - ask for a fixed fraction of the drift back, as a
+    /// velocity, every step - puts the correction into the bodies as real
+    /// speed. When the solver converges that is harmless; when it does not -
+    /// a heavy weight on a light chain, where eight passes are not enough to
+    /// carry the weight up the links - each step's correction overshoots a
+    /// little, the next is fed from the overshoot, and the chain gains energy
+    /// until it flies apart. Measured, not guessed: a ball six times a link's
+    /// mass on ten links pulled its pins 90 pixels apart in five seconds.
+    ///
+    /// So the drift is taken back the way a very stiff, heavily damped
+    /// spring would take it back (`Settings.joint_hertz`). The arithmetic is
+    /// `Softness`'s: an implicit spring step, which cannot add energy
+    /// however stiff it is set, and whose `impulse_scale` term lets a little
+    /// of the accumulated impulse go every pass - the damping. Box2D v3's
+    /// joints are built the same way.
+    fn rigid(self: Step, mass: f32, cdot: f32, c: f32, total: f32) f32 {
+        const s = self.stiffness;
+        const bias = std.math.clamp(s.bias_rate * c, -self.max_push, self.max_push);
+        return -s.mass_scale * mass * (cdot + bias) - s.impulse_scale * total;
     }
 
-    fn pushBackPoint(self: Step, c: Vec2) Vec2 {
-        return c.scale(self.baumgarte * self.inv_dt).clampLen(self.max_push);
+    /// The same about an angle, which has no speed limit to share with the
+    /// linear ones: half a turn back at the rate the spring allows is
+    /// already a gentle correction.
+    fn rigidAngle(self: Step, mass: f32, cdot: f32, c: f32, total: f32) f32 {
+        const s = self.stiffness;
+        return -s.mass_scale * mass * (cdot + s.bias_rate * c) - s.impulse_scale * total;
     }
 
-    /// The same for an angle, which has no speed limit to share with the
-    /// linear ones: a fraction of at most half a turn is already a gentle
-    /// correction.
-    fn pushBackAngle(self: Step, c: f32) f32 {
-        return self.baumgarte * self.inv_dt * c;
+    /// The same at a point, both directions at once. `matrix` is the
+    /// point's effective mass matrix, not yet inverted.
+    fn rigidPoint(self: Step, matrix: Sym22, cdot: Vec2, c: Vec2, total: Vec2) Vec2 {
+        const s = self.stiffness;
+        const bias = c.scale(s.bias_rate).clampLen(self.max_push);
+        return matrix.solve(cdot.add(bias)).scale(-s.mass_scale).sub(total.scale(s.impulse_scale));
     }
 
-    /// A one-sided limit's bias. Short of the stop by `c > 0`, the gap may
-    /// be closed this step and no more - so the joint arrives at its stop
-    /// rather than going through and bouncing back, which is the
-    /// speculative trick Box2D v3 plays; past it, the error is pushed back
-    /// like any other.
-    fn limit(self: Step, c: f32) f32 {
-        if (c > 0) return c * self.inv_dt;
-        return @max(self.baumgarte * self.inv_dt * c, -self.max_push);
+    /// A one-sided limit. Short of the stop by `c > 0`, the gap may be
+    /// closed this step and no more, exactly - so the joint arrives at its
+    /// stop rather than going through and bouncing back, which is the
+    /// speculative trick Box2D v3 plays. Past it, the drift is taken back
+    /// like any other. The caller clamps the total at zero: a stop pushes
+    /// and never pulls.
+    fn limit(self: Step, mass: f32, cdot: f32, c: f32, total: f32) f32 {
+        if (c > 0) return -mass * (cdot + c * self.inv_dt);
+        return self.rigid(mass, cdot, c, total);
     }
 
-    fn limitAngle(self: Step, c: f32) f32 {
-        if (c > 0) return c * self.inv_dt;
-        return self.baumgarte * self.inv_dt * c;
+    fn limitAngle(self: Step, mass: f32, cdot: f32, c: f32, total: f32) f32 {
+        if (c > 0) return -mass * (cdot + c * self.inv_dt);
+        return self.rigidAngle(mass, cdot, c, total);
     }
 };
 
@@ -545,6 +574,14 @@ pub const Softness = struct {
         const a2 = dt * omega * a1;
         const a3 = 1 / (1 + a2);
         return .{ .bias_rate = omega / a1, .mass_scale = a2 * a3, .impulse_scale = a3 };
+    }
+
+    /// Rigid, taking back `fraction` of the drift per step as a velocity:
+    /// Baumgarte's way, with none of a spring's give. What a joint was
+    /// before it was soft, kept for the tests that check a pass against
+    /// numbers worked out by hand.
+    pub fn baumgarte(fraction: f32, inv_dt: f32) Softness {
+        return .{ .bias_rate = fraction * inv_dt, .mass_scale = 1, .impulse_scale = 0 };
     }
 
     /// The impulse a soft constraint with effective mass `mass`, speed
@@ -701,9 +738,9 @@ pub const Distance = struct {
 
     fn solve(self: *Distance, m: Masses, v: *Velocities, step: Step) void {
         if (self.spring == null) {
-            // A rod: the length, exactly, pushing and pulling.
+            // A rod: the length, pushing and pulling.
             const cdot = self.axis.dot(v.relative(self.ra, self.rb));
-            const impulse = -self.axial_mass * (cdot + step.pushBack(self.current - self.length));
+            const impulse = step.rigid(self.axial_mass, cdot, self.current - self.length, self.impulse);
             self.impulse += impulse;
             v.push(m, self.axis.scale(impulse), self.ra, self.rb);
             return;
@@ -718,7 +755,7 @@ pub const Distance = struct {
 
         if (self.min_length > 0) {
             const cdot = self.axis.dot(v.relative(self.ra, self.rb));
-            const wanted = -self.axial_mass * (cdot + step.limit(self.current - self.min_length));
+            const wanted = step.limit(self.axial_mass, cdot, self.current - self.min_length, self.lower_impulse);
             const impulse = clampedAdd(&self.lower_impulse, wanted, 0, std.math.inf(f32));
             v.push(m, self.axis.scale(impulse), self.ra, self.rb);
         }
@@ -727,7 +764,7 @@ pub const Distance = struct {
             // Measured the other way, so the one-sided rule is the same: the
             // gap to the limit shrinks as the length grows.
             const cdot = -self.axis.dot(v.relative(self.ra, self.rb));
-            const wanted = -self.axial_mass * (cdot + step.limit(self.max_length - self.current));
+            const wanted = step.limit(self.axial_mass, cdot, self.max_length - self.current, self.upper_impulse);
             const impulse = clampedAdd(&self.upper_impulse, wanted, 0, std.math.inf(f32));
             v.push(m, self.axis.scale(-impulse), self.ra, self.rb);
         }
@@ -812,15 +849,15 @@ pub const Revolute = struct {
             if (self.limit) |limit| {
                 const lower = @min(limit.lower, limit.upper);
                 const upper = @max(limit.lower, limit.upper);
-                const up = -self.axial_mass * (v.wb - v.wa + step.limitAngle(self.angle - lower));
+                const up = step.limitAngle(self.axial_mass, v.wb - v.wa, self.angle - lower, self.lower_impulse);
                 v.turn(m, clampedAdd(&self.lower_impulse, up, 0, std.math.inf(f32)));
-                const down = -self.axial_mass * (v.wa - v.wb + step.limitAngle(upper - self.angle));
+                const down = step.limitAngle(self.axial_mass, v.wa - v.wb, upper - self.angle, self.upper_impulse);
                 v.turn(m, -clampedAdd(&self.upper_impulse, down, 0, std.math.inf(f32)));
             }
         }
 
         const cdot = v.relative(self.ra, self.rb);
-        const impulse = self.matrix.solve(cdot.add(step.pushBackPoint(self.separation)).neg());
+        const impulse = step.rigidPoint(self.matrix, cdot, self.separation, self.impulse);
         self.impulse = self.impulse.add(impulse);
         v.push(m, impulse, self.ra, self.rb);
     }
@@ -938,18 +975,25 @@ pub const Prismatic = struct {
         if (self.limit) |limit| {
             const lower = @min(limit.lower, limit.upper);
             const upper = @max(limit.lower, limit.upper);
-            const out = -self.axial_mass * (self.axialSpeed(v) + step.limit(self.translation - lower));
+            const out = step.limit(self.axial_mass, self.axialSpeed(v), self.translation - lower, self.lower_impulse);
             self.pushAxial(m, v, clampedAdd(&self.lower_impulse, out, 0, std.math.inf(f32)));
-            const in = -self.axial_mass * (-self.axialSpeed(v) + step.limit(upper - self.translation));
+            const in = step.limit(self.axial_mass, -self.axialSpeed(v), upper - self.translation, self.upper_impulse);
             self.pushAxial(m, v, -clampedAdd(&self.upper_impulse, in, 0, std.math.inf(f32)));
         }
 
+        // Across the axis and against turning, as one block, taking back
+        // drift the way `Step.rigid` explains - written out here because
+        // one row is a length and the other an angle.
+        const s = step.stiffness;
         const cdot: Vec2 = .{
             .x = self.perp.dot(v.vb.sub(v.va)) + self.s2 * v.wb - self.s1 * v.wa,
             .y = v.wb - v.wa,
         };
-        const bias: Vec2 = .{ .x = step.pushBack(self.perp_error), .y = step.pushBackAngle(self.angle_error) };
-        const impulse = self.matrix.solve(cdot.add(bias).neg());
+        const bias: Vec2 = .{
+            .x = std.math.clamp(s.bias_rate * self.perp_error, -step.max_push, step.max_push),
+            .y = s.bias_rate * self.angle_error,
+        };
+        const impulse = self.matrix.solve(cdot.add(bias)).scale(-s.mass_scale).sub(self.impulse.scale(s.impulse_scale));
         self.impulse = self.impulse.add(impulse);
         v.pushWith(m, self.perp.scale(impulse.x), impulse.x * self.s1 + impulse.y, impulse.x * self.s2 + impulse.y);
     }
@@ -1012,7 +1056,7 @@ pub const Weld = struct {
             const impulse = if (self.angular_spring != null)
                 self.angular_softness.impulse(self.axial_mass, cdot, self.angle_error, self.angular_impulse)
             else
-                -self.axial_mass * (cdot + step.pushBackAngle(self.angle_error));
+                step.rigidAngle(self.axial_mass, cdot, self.angle_error, self.angular_impulse);
             self.angular_impulse += impulse;
             v.turn(m, impulse);
         }
@@ -1022,7 +1066,7 @@ pub const Weld = struct {
             const s = self.linear_softness;
             const x = self.matrix.solve(cdot.add(self.separation.scale(s.bias_rate)));
             break :soft x.scale(-s.mass_scale).sub(self.linear_impulse.scale(s.impulse_scale));
-        } else self.matrix.solve(cdot.add(step.pushBackPoint(self.separation)).neg());
+        } else step.rigidPoint(self.matrix, cdot, self.separation, self.linear_impulse);
         self.linear_impulse = self.linear_impulse.add(impulse);
         v.push(m, impulse, self.ra, self.rb);
     }
@@ -1187,7 +1231,7 @@ pub const Wheel = struct {
             const impulse = if (self.spring != null)
                 self.softness.impulse(self.axial_mass, self.axialSpeed(v), self.translation, self.spring_impulse)
             else
-                -self.axial_mass * (self.axialSpeed(v) + step.pushBack(self.translation));
+                step.rigid(self.axial_mass, self.axialSpeed(v), self.translation, self.spring_impulse);
             self.spring_impulse += impulse;
             self.pushAxial(m, v, impulse);
         }
@@ -1201,14 +1245,14 @@ pub const Wheel = struct {
         if (self.limit) |limit| {
             const lower = @min(limit.lower, limit.upper);
             const upper = @max(limit.lower, limit.upper);
-            const out = -self.axial_mass * (self.axialSpeed(v) + step.limit(self.translation - lower));
+            const out = step.limit(self.axial_mass, self.axialSpeed(v), self.translation - lower, self.lower_impulse);
             self.pushAxial(m, v, clampedAdd(&self.lower_impulse, out, 0, std.math.inf(f32)));
-            const in = -self.axial_mass * (-self.axialSpeed(v) + step.limit(upper - self.translation));
+            const in = step.limit(self.axial_mass, -self.axialSpeed(v), upper - self.translation, self.upper_impulse);
             self.pushAxial(m, v, -clampedAdd(&self.upper_impulse, in, 0, std.math.inf(f32)));
         }
 
         const cdot = self.perp.dot(v.vb.sub(v.va)) + self.s2 * v.wb - self.s1 * v.wa;
-        const impulse = -self.perp_mass * (cdot + step.pushBack(self.perp_error));
+        const impulse = step.rigid(self.perp_mass, cdot, self.perp_error, self.perp_impulse);
         self.perp_impulse += impulse;
         v.pushWith(m, self.perp.scale(impulse), impulse * self.s1, impulse * self.s2);
     }
@@ -1226,10 +1270,12 @@ pub const Wheel = struct {
 // Tests
 // -------------------------------------------------------------------------
 
+/// Rigid, so a pass can be checked against numbers worked out by hand. The
+/// world's joints give a little, on purpose; see `Step.rigid`.
 const test_step: Step = .{
     .dt = 1.0 / 60.0,
     .inv_dt = 60,
-    .baumgarte = 0.2,
+    .stiffness = .baumgarte(0.2, 60),
     .max_push = 3,
     .slop = 0.005,
     .units_per_metre = 1,
