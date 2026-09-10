@@ -45,6 +45,7 @@ const std = @import("std");
 pub const World = @import("World.zig");
 pub const Body = @import("body.zig");
 pub const shape = @import("shape.zig");
+pub const joint = @import("joint.zig");
 pub const collide = @import("collide.zig");
 pub const broadphase = @import("broadphase.zig");
 pub const contact = @import("contact.zig");
@@ -66,6 +67,16 @@ pub const Circle = shape.Circle;
 pub const Polygon = shape.Polygon;
 pub const Material = shape.Material;
 pub const Filter = shape.Filter;
+
+/// What names a joint. See `World.createJoint`.
+pub const JointId = joint.Id;
+/// What `World.createJoint` takes. See `joint`.
+pub const JointDef = joint.Def;
+pub const Joint = joint.Joint;
+pub const Spring = joint.Spring;
+pub const Limit = joint.Limit;
+pub const AngularMotor = joint.AngularMotor;
+pub const LinearMotor = joint.LinearMotor;
 
 pub const Settings = World.Settings;
 pub const ContactEvent = World.ContactEvent;
@@ -89,10 +100,13 @@ test {
     _ = World;
     _ = Body;
     _ = shape;
+    _ = joint;
     _ = collide;
     _ = broadphase;
     _ = contact;
     _ = solver;
     _ = geometry;
     _ = @import("physics_test.zig");
+    _ = @import("joint_test.zig");
+    _ = @import("sleep_test.zig");
 }

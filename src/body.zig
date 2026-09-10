@@ -25,6 +25,12 @@
 //! **A body owns nothing**, so it is handed out by pointer from the world's
 //! table and written to directly. The pointer is good until the next
 //! `createBody`; the handle is good for ever.
+//!
+//! **A dynamic body falls asleep** when it and everything it touches have
+//! been still for a while, and a step skips it until something wakes it.
+//! Writing a velocity, applying a force or an impulse, and `setTransform`
+//! all wake it, because a sleeping body has all of those at zero and the
+//! step notices when one is not. See `World` for the rest of the rules.
 
 const std = @import("std");
 const testing = std.testing;
@@ -70,6 +76,11 @@ pub const Def = struct {
     gravity_scale: f32 = 1,
     /// A body that never turns, however it is hit. A character capsule.
     fixed_rotation: bool = false,
+    /// Whether it may fall asleep. Turn it off for a body a game steers by
+    /// setting its velocity only when a key is down: asleep, it would not
+    /// notice the first frame of the next press. A body that may not sleep
+    /// keeps everything it touches awake too.
+    allow_sleep: bool = true,
     /// Yours. The body never reads it.
     user_data: u64 = 0,
 };
@@ -90,6 +101,11 @@ angular_velocity: f32,
 /// Accumulated until the next step, then cleared.
 force: Vec2 = .zero,
 torque: f32 = 0,
+/// What the solver is pushing it out of other bodies with this step: moves
+/// it when positions are integrated, and is then forgotten, so the push
+/// never becomes speed. See `contact`.
+push_velocity: Vec2 = .zero,
+push_angular: f32 = 0,
 mass: f32 = 0,
 inv_mass: f32 = 0,
 /// Rotational inertia about the centre of mass.
@@ -99,7 +115,21 @@ linear_damping: f32,
 angular_damping: f32,
 gravity_scale: f32,
 fixed_rotation: bool,
+allow_sleep: bool,
 user_data: u64,
+/// False while asleep. Only ever false for a dynamic body.
+awake: bool = true,
+/// How long it has been still, in seconds. Reset by any movement; see
+/// `World.Settings.time_to_sleep`.
+sleep_time: f32 = 0,
+/// Moved by `setTransform` since the last step. Contacts that were asleep
+/// against it are looked at again rather than kept, so a platform moved by
+/// hand does not leave what slept on it floating.
+teleported: bool = false,
+/// How far its shapes reach from its centre of mass. What a spin moves its
+/// furthest edge by, for deciding whether it is still. Kept by
+/// `World.updateMass`.
+extent: f32 = 0,
 /// The head of the list of shapes on this body. The list is threaded
 /// through the shapes themselves - see `World.ShapeEntry.next`.
 first_shape: ShapeId = .none,
@@ -118,6 +148,7 @@ pub fn fromDef(def: Def) Body {
         .angular_damping = def.angular_damping,
         .gravity_scale = def.gravity_scale,
         .fixed_rotation = def.fixed_rotation,
+        .allow_sleep = def.allow_sleep,
         .user_data = def.user_data,
     };
 }
@@ -130,10 +161,54 @@ pub fn position(self: *const Body) Vec2 {
 /// Put the body somewhere, at once and without a velocity. For placing
 /// things at load time and for teleporting; anything else should be a
 /// velocity or a force, which the solver can reason about.
+///
+/// Wakes it, and whatever was asleep against it.
 pub fn setTransform(self: *Body, p: Vec2, radians: f32) void {
     self.transform = .init(p, radians);
     self.angle = radians;
     self.center = self.transform.apply(self.local_center);
+    self.teleported = true;
+    self.wake();
+}
+
+/// Whether a step will move it. Static and kinematic bodies never sleep.
+pub fn isAwake(self: *const Body) bool {
+    return self.awake;
+}
+
+/// Wake it. Everything it touches wakes with it at the end of the next
+/// step, because an island sleeps and wakes as one.
+///
+/// Needed only for a change the world cannot see - gravity turned round, a
+/// joint's limit or spring moved. Velocities, forces, impulses, moving it,
+/// new shapes and a joint's motor or pointer are all seen.
+pub fn wake(self: *Body) void {
+    if (self.type != .dynamic) return;
+    self.awake = true;
+    self.sleep_time = 0;
+}
+
+/// Put it to sleep now, still. The world does this to whole islands; a
+/// game may do it to what it has just placed, so a level starts at rest
+/// rather than settling. Asleep with anything awake touching it, it is
+/// woken again at the end of the next step.
+pub fn sleep(self: *Body) void {
+    if (self.type != .dynamic) return;
+    self.awake = false;
+    // Longer than any time to sleep: a body put to sleep by hand does not
+    // hold its island awake while its timer catches up.
+    self.sleep_time = std.math.inf(f32);
+    self.linear_velocity = .zero;
+    self.angular_velocity = 0;
+    self.force = .zero;
+    self.torque = 0;
+}
+
+/// Whether something from outside has pushed it since it fell asleep.
+/// Sleeping zeroed all four, so any of them not zero is news.
+pub fn isPushed(self: *const Body) bool {
+    return self.linear_velocity.x != 0 or self.linear_velocity.y != 0 or self.angular_velocity != 0 or
+        self.force.x != 0 or self.force.y != 0 or self.torque != 0;
 }
 
 /// Rebuild the origin's transform from the centre and angle after a step

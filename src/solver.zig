@@ -88,79 +88,97 @@ pub fn forRange(
 pub const max_colours = 24;
 pub const overflow = max_colours;
 
-/// The contacts of a step, grouped by colour.
-pub const Colouring = struct {
-    /// Which colours each body slot is already in this step, as bits.
-    used: std.ArrayList(u32) = .empty,
-    /// The colour of each constraint, in input order.
-    colour: std.ArrayList(u8) = .empty,
-    /// The constraints, reordered so each colour is one run.
-    sorted: std.ArrayList(Constraint) = .empty,
-    /// Where each colour starts in `sorted`; one past the end at the end.
-    offsets: [max_colours + 2]u32 = @splat(0),
+/// Constraints of one kind, grouped by colour: the contacts of a step are
+/// one `Colouring(contact.Constraint)`, and its joints another.
+///
+/// **This is a function that returns a type**, which is how Zig spells a
+/// generic. `Item` is whatever is being coloured, and the body of `assign`
+/// asks four things of it - `body_a`, `body_b`, `inv_mass_a`, `inv_mass_b` -
+/// by name. Nothing declares that those fields must exist: the compiler
+/// checks when `Colouring(T)` is first used with a `T`, and a type without
+/// them is a compile error at that use, naming the missing field. Duck
+/// typing, settled before the program runs. The price is that the contract
+/// lives here, in a comment, rather than in an interface.
+///
+/// A body with an inverse mass of zero is never written by a solve - see
+/// `contact.store` - so it does not count as shared, and may be in every
+/// colour.
+pub fn Colouring(comptime Item: type) type {
+    return struct {
+        const Self = @This();
 
-    pub const empty: Colouring = .{};
+        /// Which colours each body slot is already in this step, as bits.
+        used: std.ArrayList(u32) = .empty,
+        /// The colour of each item, in input order.
+        colour: std.ArrayList(u8) = .empty,
+        /// The items, reordered so each colour is one run.
+        sorted: std.ArrayList(Item) = .empty,
+        /// Where each colour starts in `sorted`; one past the end at the end.
+        offsets: [max_colours + 2]u32 = @splat(0),
 
-    pub fn deinit(self: *Colouring, gpa: Allocator) void {
-        self.used.deinit(gpa);
-        self.colour.deinit(gpa);
-        self.sorted.deinit(gpa);
-        self.* = undefined;
-    }
+        pub const empty: Self = .{};
 
-    /// Give every constraint a colour and sort them into runs.
-    ///
-    /// Greedy: each constraint takes the lowest colour neither of its
-    /// movable bodies is in yet. Not optimal - that problem is hard - and
-    /// not needed to be: a few more colours cost a few more joins.
-    pub fn assign(self: *Colouring, gpa: Allocator, constraints: []const Constraint, body_slots: usize) Allocator.Error!void {
-        try self.used.resize(gpa, body_slots);
-        @memset(self.used.items, 0);
-        try self.colour.resize(gpa, constraints.len);
+        pub fn deinit(self: *Self, gpa: Allocator) void {
+            self.used.deinit(gpa);
+            self.colour.deinit(gpa);
+            self.sorted.deinit(gpa);
+            self.* = undefined;
+        }
 
-        var counts: [max_colours + 1]u32 = @splat(0);
-        for (constraints, self.colour.items) |*c, *colour| {
-            var mask: u32 = 0;
-            if (c.inv_mass_a != 0) mask |= self.used.items[c.body_a];
-            if (c.inv_mass_b != 0) mask |= self.used.items[c.body_b];
+        /// Give every item a colour and sort them into runs.
+        ///
+        /// Greedy: each item takes the lowest colour neither of its movable
+        /// bodies is in yet. Not optimal - that problem is hard - and not
+        /// needed to be: a few more colours cost a few more joins.
+        pub fn assign(self: *Self, gpa: Allocator, items: []const Item, body_slots: usize) Allocator.Error!void {
+            try self.used.resize(gpa, body_slots);
+            @memset(self.used.items, 0);
+            try self.colour.resize(gpa, items.len);
 
-            const free = @ctz(~mask);
-            const chosen: u8 = if (free < max_colours) @intCast(free) else overflow;
-            colour.* = chosen;
-            counts[chosen] += 1;
-            if (chosen != overflow) {
-                const bit = @as(u32, 1) << @intCast(chosen);
-                if (c.inv_mass_a != 0) self.used.items[c.body_a] |= bit;
-                if (c.inv_mass_b != 0) self.used.items[c.body_b] |= bit;
+            var counts: [max_colours + 1]u32 = @splat(0);
+            for (items, self.colour.items) |*c, *colour| {
+                var mask: u32 = 0;
+                if (c.inv_mass_a != 0) mask |= self.used.items[c.body_a];
+                if (c.inv_mass_b != 0) mask |= self.used.items[c.body_b];
+
+                const free = @ctz(~mask);
+                const chosen: u8 = if (free < max_colours) @intCast(free) else overflow;
+                colour.* = chosen;
+                counts[chosen] += 1;
+                if (chosen != overflow) {
+                    const bit = @as(u32, 1) << @intCast(chosen);
+                    if (c.inv_mass_a != 0) self.used.items[c.body_a] |= bit;
+                    if (c.inv_mass_b != 0) self.used.items[c.body_b] |= bit;
+                }
+            }
+
+            // Prefix sums give each colour its run; a second pass scatters.
+            self.offsets[0] = 0;
+            for (counts, 0..) |n, i| self.offsets[i + 1] = self.offsets[i] + n;
+
+            try self.sorted.resize(gpa, items.len);
+            var cursor = self.offsets;
+            for (items, self.colour.items) |c, colour| {
+                self.sorted.items[cursor[colour]] = c;
+                cursor[colour] += 1;
             }
         }
 
-        // Prefix sums give each colour its run; a second pass scatters.
-        self.offsets[0] = 0;
-        for (counts, 0..) |n, i| self.offsets[i + 1] = self.offsets[i] + n;
-
-        try self.sorted.resize(gpa, constraints.len);
-        var cursor = self.offsets;
-        for (constraints, self.colour.items) |c, colour| {
-            self.sorted.items[cursor[colour]] = c;
-            cursor[colour] += 1;
+        /// The items of one colour, to solve at once.
+        pub fn run(self: *Self, colour: usize) []Item {
+            return self.sorted.items[self.offsets[colour]..self.offsets[colour + 1]];
         }
-    }
 
-    /// The constraints of one colour, to solve at once.
-    pub fn run(self: *Colouring, colour: usize) []Constraint {
-        return self.sorted.items[self.offsets[colour]..self.offsets[colour + 1]];
-    }
-
-    /// How many colours were needed, not counting the overflow.
-    pub fn colourCount(self: *const Colouring) usize {
-        var n: usize = 0;
-        for (0..max_colours) |c| {
-            if (self.offsets[c + 1] > self.offsets[c]) n = c + 1;
+        /// How many colours were needed, not counting the overflow.
+        pub fn colourCount(self: *const Self) usize {
+            var n: usize = 0;
+            for (0..max_colours) |c| {
+                if (self.offsets[c + 1] > self.offsets[c]) n = c + 1;
+            }
+            return n;
         }
-        return n;
-    }
-};
+    };
+}
 
 // -------------------------------------------------------------------------
 // Tests
@@ -186,7 +204,7 @@ fn fakeConstraint(a: u32, b: u32, a_moves: bool, b_moves: bool) Constraint {
 
 test "no colour holds two contacts that share a movable body" {
     const gpa = testing.allocator;
-    var colouring: Colouring = .empty;
+    var colouring: Colouring(Constraint) = .empty;
     defer colouring.deinit(gpa);
 
     // A chain: 0-1, 1-2, 2-3, and everything against the ground, body 9.
@@ -222,7 +240,7 @@ test "no colour holds two contacts that share a movable body" {
 
 test "a body in more contacts than there are colours spills into the overflow" {
     const gpa = testing.allocator;
-    var colouring: Colouring = .empty;
+    var colouring: Colouring(Constraint) = .empty;
     defer colouring.deinit(gpa);
 
     var constraints: [max_colours + 3]Constraint = undefined;
