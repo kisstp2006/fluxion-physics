@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+﻿// SPDX-License-Identifier: BSD-2-Clause
 
 //! A rigid body: where it is, how it moves, and what it weighs.
 //!
@@ -101,11 +101,6 @@ angular_velocity: f32,
 /// Accumulated until the next step, then cleared.
 force: Vec2 = .zero,
 torque: f32 = 0,
-/// What the solver is pushing it out of other bodies with this step: moves
-/// it when positions are integrated, and is then forgotten, so the push
-/// never becomes speed. See `contact`.
-push_velocity: Vec2 = .zero,
-push_angular: f32 = 0,
 mass: f32 = 0,
 inv_mass: f32 = 0,
 /// Rotational inertia about the centre of mass.

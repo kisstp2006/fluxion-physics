@@ -9,6 +9,13 @@
 //! spring bounces at the frequency it was given, a car drives. And the
 //! same scene with a thousand joints is the same to the bit on every core
 //! and on none.
+//!
+//! **Joints under load** have scenes of their own, at the end, because
+//! that is where a solver shows what it is made of: a weight many times
+//! heavier than the links holding it, knocked, dropped, swung. Each has a
+//! limit on how far any joint may come apart, set at about twice what the
+//! solver does now; the one before this one tore every one of them apart
+//! by tens or hundreds of pixels.
 
 const std = @import("std");
 const testing = std.testing;
@@ -56,16 +63,16 @@ test "a pendulum swings about its pin, keeps its length, and comes back up" {
             lowest = @max(lowest, p.y);
             if (p.x < 0) highest_far = @min(highest_far, p.y);
         }
-        // A centimetre or so at the bottom of the swing, and not less: a
-        // step moves the bob along the tangent, which on a circle is
-        // outwards by `v^2 dt^2 / 2L`, and the solver takes a fifth of the
-        // error back per step. At 6 m/s that settles near 1.3 cm - the
-        // price of having no position pass, and invisible at 2 m.
-        try testing.expect(stretch < 0.02);
-        try testing.expectApproxEqAbs(@as(f32, 2), lowest, 0.02);
-        // Back up to within a few centimetres of where it was let go: the
-        // solver loses very little of the swing.
-        try testing.expect(highest_far < 0.05);
+        // Under a millimetre at the bottom of the swing, at 6 m/s. A step
+        // moves the bob along the tangent, which on a circle is outwards by
+        // `v^2 h^2 / 2L`, and in a quarter of a sixtieth that is a sixteenth
+        // of what a whole step's would be - one of the things substeps buy.
+        // Before them it was 1.3 cm.
+        try testing.expect(stretch < 0.003);
+        try testing.expectApproxEqAbs(@as(f32, 2), lowest, 0.003);
+        // And back up to where it was let go: the solver loses nothing of
+        // the swing that can be measured.
+        try testing.expect(highest_far < 0.01);
     }
 }
 
@@ -110,7 +117,7 @@ test "a thousand-link chain hangs together, and is the same on every core and on
             const anchors = world.jointAnchors(entry.value);
             worst = @max(worst, anchors[0].dist(anchors[1]));
         }
-        try testing.expect(worst < 0.02);
+        try testing.expect(worst < 0.005);
         // Three seconds is about half a swing of a chain this long: every
         // free end has been down through the bottom and is on its way up
         // the far side, still well below where it started.
@@ -170,8 +177,8 @@ test "a rod holds its length, a rope only its longest, and a spring bounces at i
         rope_longest = @max(rope_longest, length);
         if (rope_went_taut_at == 0 and length > 1.99) rope_went_taut_at = i;
     }
-    // The pendulum's centimetre, for the same reason: see above.
-    try testing.expect(rod_stretch < 0.02);
+    // The pendulum's millimetre, for the same reason: see above.
+    try testing.expect(rod_stretch < 0.005);
     try testing.expect(rope_longest < 2.02);
     // A free fall of one metre takes 0.45 seconds: the rope did nothing
     // until then.
@@ -493,4 +500,196 @@ test "destroying a body takes its joints with it, and bad definitions are refuse
     try testing.expectError(error.NoSuchBody, world.createJoint(.{ .revolute = .{ .body_a = a, .body_b = b, .anchor = .zero } }));
     try testing.expectError(error.SameBody, world.createJoint(.{ .weld = .{ .body_a = c, .body_b = c, .anchor = .zero } }));
     try testing.expectError(error.NoSuchBody, world.addShape(b, .circle(1)));
+}
+
+// -------------------------------------------------------------------------
+// Joints under load
+// -------------------------------------------------------------------------
+
+/// A hundred pixels to the metre, like a game that thinks in pixels.
+const pixels: World.Settings = .{ .units_per_metre = 100 };
+
+/// How far the worst joint in the world is from whole, now: the gap at a
+/// pin, or how far a rod is from its length. Pixels.
+fn worstJoint(world: *World) f32 {
+    var worst: f32 = 0;
+    var it = world.jointIterator();
+    while (it.next()) |entry| {
+        const anchors = world.jointAnchors(entry.value);
+        const err = switch (entry.value.kind) {
+            .distance => |d| @abs(anchors[0].dist(anchors[1]) - d.length),
+            .mouse => 0,
+            else => anchors[0].dist(anchors[1]),
+        };
+        worst = @max(worst, err);
+    }
+    return worst;
+}
+
+/// Step for `n` steps, and hand back the worst any joint ever got.
+fn worstOver(world: *World, jobs: *Jobs, n: usize) !f32 {
+    var worst: f32 = 0;
+    for (0..n) |_| {
+        try world.step(dt, jobs);
+        worst = @max(worst, worstJoint(world));
+    }
+    return worst;
+}
+
+/// Ten links of eighteen pixels from a hook at (700, 40), straight down,
+/// and a ball of `radius` on the end of them.
+fn chainAndBall(world: *World, radius: f32) !physics.BodyId {
+    const hook = try world.createBody(.{ .type = .static, .position = .init(700, 40) });
+    var previous = hook;
+    for (0..10) |i| {
+        const y = 40 + (@as(f32, @floatFromInt(i)) + 0.5) * 18;
+        const link = try world.createBody(.{ .position = .init(700, y) });
+        _ = try world.addShape(link, .{ .geometry = .{ .polygon = .box(3, 9) }, .filter = .{ .group = -1 } });
+        _ = try world.createJoint(.{ .revolute = .{ .body_a = previous, .body_b = link, .anchor = .init(700, y - 9) } });
+        previous = link;
+    }
+    const ball = try world.createBody(.{ .position = .init(700, 220 + radius) });
+    _ = try world.addShape(ball, .{ .geometry = .{ .circle = .{ .radius = radius } }, .filter = .{ .group = -1 } });
+    _ = try world.createJoint(.{ .revolute = .{ .body_a = previous, .body_b = ball, .anchor = .init(700, 220) } });
+    return ball;
+}
+
+test "a wrecking ball on a light chain stays on it when it is knocked" {
+    for (modes) |mode| {
+        var jobs: Jobs = try .init(gpa, mode);
+        defer jobs.deinit();
+        var world: World = .init(gpa, pixels);
+        defer world.deinit();
+
+        // A ball of radius 30 is 2827 to a link's 108: twenty-six times as
+        // heavy as what holds it.
+        const ball = try chainAndBall(&world, 30);
+        const hanging = try worstOver(&world, &jobs, 60);
+        // Knocked sideways at three metres a second.
+        const b = world.body(ball).?;
+        b.applyImpulse(.init(b.mass * 300, 0), b.center);
+        const knocked = try worstOver(&world, &jobs, 540);
+
+        try testing.expect(hanging < 2);
+        try testing.expect(knocked < 3);
+        // And it is still on the end of the chain, not on the floor.
+        try testing.expect(world.body(ball).?.center.dist(.init(700, 40)) < 215 + 30);
+    }
+}
+
+test "a chain thrown down from level whips, and holds" {
+    for (modes) |mode| {
+        var jobs: Jobs = try .init(gpa, mode);
+        defer jobs.deinit();
+        var world: World = .init(gpa, pixels);
+        defer world.deinit();
+
+        // Thirty links straight out to the side of the hook, and a ball on
+        // the end: let go, the end comes down through the bottom far faster
+        // than anything else, and every link is yanked.
+        const hook = try world.createBody(.{ .type = .static, .position = .init(700, 40) });
+        var previous = hook;
+        for (0..30) |i| {
+            const x = 700 - (@as(f32, @floatFromInt(i)) + 0.5) * 18;
+            const link = try world.createBody(.{ .position = .init(x, 40), .angle = std.math.pi / 2.0 });
+            _ = try world.addShape(link, .{ .geometry = .{ .polygon = .box(3, 9) }, .filter = .{ .group = -1 } });
+            _ = try world.createJoint(.{ .revolute = .{ .body_a = previous, .body_b = link, .anchor = .init(x + 9, 40) } });
+            previous = link;
+        }
+        const ball = try world.createBody(.{ .position = .init(700 - 540 - 20, 40) });
+        _ = try world.addShape(ball, .{ .geometry = .{ .circle = .{ .radius = 20 } }, .filter = .{ .group = -1 } });
+        _ = try world.createJoint(.{ .revolute = .{ .body_a = previous, .body_b = ball, .anchor = .init(700 - 540, 40) } });
+
+        try testing.expect(try worstOver(&world, &jobs, 600) < 8);
+    }
+}
+
+test "a rope of rods holds a crate twenty times a bead" {
+    for (modes) |mode| {
+        var jobs: Jobs = try .init(gpa, mode);
+        defer jobs.deinit();
+        var world: World = .init(gpa, pixels);
+        defer world.deinit();
+
+        // Ten rods of twenty pixels between beads, out to the side, and a
+        // crate on the end, swinging down from level.
+        var previous = try world.createBody(.{ .type = .static, .position = .init(400, 40) });
+        var at: Vec2 = .init(400, 40);
+        for (0..10) |_| {
+            const next = at.add(.init(20, 0));
+            const bead = try world.createBody(.{ .position = next });
+            _ = try world.addShape(bead, .{ .geometry = .{ .circle = .{ .radius = 4 } }, .filter = .{ .group = -1 } });
+            _ = try world.createJoint(.{ .distance = .{ .body_a = previous, .body_b = bead, .anchor_a = at, .anchor_b = next } });
+            previous = bead;
+            at = next;
+        }
+        const crate_at = at.add(.init(20, 0));
+        const crate = try world.createBody(.{ .position = crate_at });
+        _ = try world.addShape(crate, .{ .geometry = .{ .polygon = .box(15, 16.5) }, .filter = .{ .group = -1 } });
+        _ = try world.createJoint(.{ .distance = .{ .body_a = previous, .body_b = crate, .anchor_a = at, .anchor_b = crate_at } });
+
+        try testing.expect(try worstOver(&world, &jobs, 600) < 6);
+    }
+}
+
+/// Twelve planks of 25 by 8 pixels pinned end to end between two points,
+/// the deck at y = 230 from x = 120 to 420.
+fn bridge(world: *World) !void {
+    var previous = try world.createBody(.{ .type = .static, .position = .init(120, 230) });
+    for (0..12) |i| {
+        const x = 120 + (@as(f32, @floatFromInt(i)) + 0.5) * 25;
+        const plank = try world.createBody(.{ .position = .init(x, 230) });
+        _ = try world.addShape(plank, .{ .geometry = .{ .polygon = .box(12.5, 4) }, .material = .{ .friction = 0.8 } });
+        _ = try world.createJoint(.{ .revolute = .{ .body_a = previous, .body_b = plank, .anchor = .init(x - 12.5, 230) } });
+        previous = plank;
+    }
+    const far = try world.createBody(.{ .type = .static, .position = .init(420, 230) });
+    _ = try world.createJoint(.{ .revolute = .{ .body_a = previous, .body_b = far, .anchor = .init(420, 230) } });
+}
+
+test "a light bridge holds crates ten times a plank dropped on it, the same on every core" {
+    var results: [modes.len][]f32 = undefined;
+    for (modes, 0..) |mode, mi| {
+        var jobs: Jobs = try .init(gpa, mode);
+        defer jobs.deinit();
+        var world: World = .init(gpa, pixels);
+        defer world.deinit();
+
+        try bridge(&world);
+        // A plank is 25 by 8, 200; a crate 45 by 45 is ten of them.
+        var crates: [4]physics.BodyId = undefined;
+        for (&crates, 0..) |*crate, i| {
+            const x = 170 + @as(f32, @floatFromInt(i)) * 65;
+            crate.* = try world.createBody(.{ .position = .init(x, 100 - @as(f32, @floatFromInt(i)) * 60), .angle = 0.2 });
+            _ = try world.addShape(crate.*, .box(22.5, 22.5));
+        }
+        try testing.expect(try worstOver(&world, &jobs, 600) < 10);
+        // They rest on the deck, which sags under them and holds.
+        for (crates) |crate| try testing.expect(world.body(crate).?.center.y < 300);
+
+        const out = try gpa.alloc(f32, crates.len * 2);
+        for (crates, 0..) |crate, i| {
+            out[i * 2] = world.body(crate).?.center.x;
+            out[i * 2 + 1] = world.body(crate).?.center.y;
+        }
+        results[mi] = out;
+    }
+    defer for (results) |r| gpa.free(r);
+    try testing.expectEqualSlices(f32, results[0], results[1]);
+}
+
+test "a heavy ball dropped on a light bridge bounces on it and stays on it" {
+    for (modes) |mode| {
+        var jobs: Jobs = try .init(gpa, mode);
+        defer jobs.deinit();
+        var world: World = .init(gpa, pixels);
+        defer world.deinit();
+
+        try bridge(&world);
+        // Radius 30, fourteen planks' weight, from a metre and a half up.
+        const ball = try world.createBody(.{ .position = .init(270, 50) });
+        _ = try world.addShape(ball, .circle(30));
+        try testing.expect(try worstOver(&world, &jobs, 600) < 8);
+        try testing.expect(world.body(ball).?.center.y < 300);
+    }
 }

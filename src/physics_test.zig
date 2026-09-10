@@ -102,6 +102,54 @@ test "a stack of crates stands" {
     }
 }
 
+test "a tower of twenty-five stands straight, and comes to rest" {
+    for (modes) |mode| {
+        var jobs: Jobs = try .init(gpa, mode);
+        defer jobs.deinit();
+        var scene = try floored();
+        var world = &scene.world;
+        defer world.deinit();
+
+        var crates: [25]physics.BodyId = undefined;
+        for (&crates, 0..) |*c, i| {
+            c.* = try world.createBody(.{ .position = .init(0, -0.5 - @as(f32, @floatFromInt(i))) });
+            _ = try world.addShape(c.*, .box(0.5, 0.5));
+        }
+        // Ten crates high was already too many before the corners of a
+        // box were solved together: it leaned, and fell. Now twenty-five
+        // stand, settle a few millimetres into each other, and sleep.
+        var worst_lean: f32 = 0;
+        var asleep_at: ?usize = null;
+        for (0..300) |s| {
+            try world.step(dt, &jobs);
+            worst_lean = @max(worst_lean, @abs(world.body(crates[24]).?.position().x));
+            if (asleep_at == null and world.awakeCount() == 0) asleep_at = s;
+        }
+        try testing.expect(worst_lean < 0.05);
+        try testing.expect(asleep_at != null and asleep_at.? < 180);
+        try testing.expectApproxEqAbs(@as(f32, -24.5), world.body(crates[24]).?.position().y, 0.5);
+    }
+}
+
+test "two crates made inside each other slide apart, and stop" {
+    var jobs: Jobs = try .init(gpa, .{});
+    defer jobs.deinit();
+    var world: World = .init(gpa, .{ .gravity = .zero });
+    defer world.deinit();
+
+    // Half of one inside the other. Pushed apart, they must not keep the
+    // push: a crate a level designer placed a little inside a wall should
+    // slide out of it, not be fired across the room.
+    const a = try world.createBody(.{});
+    _ = try world.addShape(a, .box(0.5, 0.5));
+    const b = try world.createBody(.{ .position = .init(0.5, 0) });
+    _ = try world.addShape(b, .box(0.5, 0.5));
+    try steps(&world, &jobs, 120);
+    const apart = world.body(b).?.position().x - world.body(a).?.position().x;
+    try testing.expectApproxEqAbs(@as(f32, 1), apart, 0.03);
+    try testing.expect(world.body(b).?.linear_velocity.sub(world.body(a).?.linear_velocity).len() < 0.01);
+}
+
 test "restitution brings a ball back up, and none leaves it down" {
     for (modes) |mode| {
         var jobs: Jobs = try .init(gpa, mode);

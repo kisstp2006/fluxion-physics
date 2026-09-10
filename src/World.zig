@@ -16,21 +16,22 @@
 //! const where = world.body(crate).?.position();
 //! ```
 //!
-//! **A step is thirteen phases**, and eight of them run on every core:
+//! **A step finds what touches once, and then solves it in substeps**
+//! (`Settings.substeps`, four by default). Most phases run on every core:
 //!
 //! | Phase | What | On |
 //! | --- | --- | --- |
-//! | wake | sleepers a joint's motor or pointer pulls on | one |
-//! | integrate velocities | gravity, forces, damping; sleepers pushed from outside wake | every core |
+//! | wake | sleepers a joint drives, or somebody pushed | one, then every core |
 //! | update boxes | each moving shape's box in the world | every core |
 //! | broad phase | which boxes overlap, of pairs with something moving | one |
 //! | narrow phase | where each pair touches | every core |
 //! | prepare contacts | into constraints, warm-started; sleeping ones kept | one |
-//! | prepare joints | lever arms, masses, springs | every core |
 //! | colour | contacts and joints into runs that share no body | one |
-//! | solve | warm start, then the passes: joints, then contacts | every core, per colour |
-//! | push | sunk-in bodies pushed apart, on a velocity that is then forgotten | every core, per colour |
-//! | integrate positions | move, turn, rebuild transforms | every core |
+//! | *each substep:* integrate velocities | gravity, forces, damping, a speed limit | every core |
+//! | *each substep:* warm start and solve | joints, then contacts, pushing back towards whole | every core, per colour |
+//! | *each substep:* integrate positions | move, turn; then the joints measured again | every core |
+//! | *each substep:* relax | the pushing taken back out of the velocities | every core, per colour |
+//! | restitution | bounces | every core, per colour |
 //! | remember | impulses for next step, begin and end events | one |
 //! | sleep | who has been still, and which islands rest or wake | one |
 //!
@@ -86,6 +87,7 @@ const contact = @import("contact.zig");
 const joint_mod = @import("joint.zig");
 const Joint = joint_mod.Joint;
 const solver = @import("solver.zig");
+const Softness = @import("Softness.zig");
 
 const World = @This();
 
@@ -100,33 +102,38 @@ pub const Settings = struct {
     /// What a metre is in your coordinates. Everything below that is a
     /// length or a speed is in metres and scaled by this.
     units_per_metre: f32 = 1,
-    /// Passes the solver makes over the contacts and joints. Eight is
-    /// Box2D's default; a deep pile wants more, a game of loose balls fewer.
-    velocity_iterations: u32 = 8,
-    /// Passes over the contacts pushing sunk-in bodies apart, on a velocity
-    /// that moves them and is then forgotten. None, and nothing is ever
-    /// pushed out; see `contact`.
-    push_iterations: u32 = 3,
-    /// How much of a penetration is removed per step. Higher is stiffer and
-    /// jumpier; lower is softer and sinks.
-    baumgarte: f32 = 0.2,
+    /// How many pieces a step is cut into. Each is a whole small step -
+    /// forces, one pass, movement, one relaxing pass - so four substeps are
+    /// eight passes, and cost about what eight passes over one step would,
+    /// but every one of them starts from where the bodies really are. That
+    /// is what holds a heavy crate on a light bridge. Box2D v3's default;
+    /// more for a wrecking ball on a thin chain, fewer for loose balls.
+    substeps: u32 = 4,
     /// How far a shape may sink before it is pushed out. Metres.
     linear_slop: f32 = 0.005,
     /// Slower than this, nothing bounces. Metres per second.
     restitution_threshold: f32 = 1,
     /// The fastest a penetration is pushed apart. Metres per second. What
-    /// keeps a body that was placed inside another from leaving at the
-    /// speed of a bullet, which is what an unbounded Baumgarte term does.
+    /// keeps a body made inside another from leaving at the speed of a
+    /// bullet.
     max_push_speed: f32 = 3,
-    /// How a rigid joint takes back the little it drifts: the way a spring
-    /// would that rang this many times a second, damped this many times
-    /// past the point of bouncing. Stiff enough that nobody sees the give,
-    /// and a spring rather than a fixed fraction per step because the
+    /// How a contact takes back sinking in: the way a spring would that
+    /// rang this many times a second, damped this many times past bouncing.
+    /// Against something that cannot move, twice as stiff. Box2D v3's
+    /// numbers, and capped at a quarter of the substep rate, past which a
+    /// substep cannot follow the spring. See `Softness`.
+    contact_hertz: f32 = 30,
+    contact_damping_ratio: f32 = 10,
+    /// The same for a rigid joint's drift. Stiff enough that nobody sees
+    /// the give; a spring rather than a fixed fraction per step because the
     /// fraction, fed back as speed, pumps energy into a light chain holding
     /// a heavy weight. Zero hertz holds joints rigid and lets them drift.
-    /// See `joint`.
     joint_hertz: f32 = 60,
     joint_damping_ratio: f32 = 2,
+    /// The fastest anything may move. Metres per second. Not a speed a game
+    /// should reach - a sanity cap, so a body flung by something that went
+    /// wrong leaves the level rather than turning to infinity.
+    max_speed: f32 = 400,
     /// Whether anything sleeps at all. Turning it off wakes what sleeps.
     enable_sleep: bool = true,
     /// Slower than this counts as still. Metres per second, of the body's
@@ -214,8 +221,9 @@ island_rest: std.ArrayList(f32) = .empty,
 /// Every contact that pushes, asleep or awake, as the islands see it:
 /// written while the contacts are prepared, read by `updateSleep`.
 links: std.ArrayList(Link) = .empty,
-/// One over the last step's length, for turning impulses into forces.
-inv_dt: f32 = 0,
+/// One over the last step's substep, for turning impulses into forces: an
+/// impulse a joint keeps is one substep's.
+inv_h: f32 = 0,
 
 /// What was touching at the end of the last step, with the impulses that
 /// held it there, and the same for the step before. Swapped every step.
@@ -566,7 +574,7 @@ pub fn jointAnchors(self: *World, j: *const Joint) [2]Vec2 {
 /// The force and torque a joint put on body B during the last step.
 pub fn jointReaction(self: *World, handle: JointId) ?joint_mod.Reaction {
     const j = self.joints.getConst(handle) orelse return null;
-    return j.reaction(self.inv_dt);
+    return j.reaction(self.inv_h);
 }
 
 /// The key two body slots are known by in `no_collide`, the same whichever
@@ -598,85 +606,140 @@ const grain_joints = 256;
 const Step = struct {
     world: *World,
     dt: f32,
-    inv_dt: f32,
+    /// One substep, and one over it.
+    h: f32,
+    inv_h: f32,
+    contact: contact.Step,
+    /// The spring a contact takes back sinking in with, and the stiffer one
+    /// against something that cannot move.
+    contact_softness: Softness,
+    static_softness: Softness,
+    /// What joints are solved with: their spring while solving, rigid and
+    /// asking nothing back while relaxing.
     joint: joint_mod.Step,
+    joint_relax: joint_mod.Step,
+    /// The fastest anything may move, in world units per second, and turn,
+    /// in radians per substep. See `integrateVelocities`.
+    max_speed: f32,
+    max_turn: f32,
 };
 
 /// Advance the world by `dt` seconds, on `jobs`.
 ///
 /// Call it with the same `dt` every time - a fixed step - because a solver
-/// tuned by a bias per step behaves differently at a different step, and
-/// because the same inputs then give the same world on every machine.
+/// tuned by springs of so many hertz behaves differently at a different
+/// step, and because the same inputs then give the same world on every
+/// machine.
+///
+/// **A step is cut into substeps** (`Settings.substeps`), and each substep
+/// is a whole small step of its own: forces into velocities, the joints
+/// measured again from where the bodies are, one pass pushing everything
+/// that is broken back towards whole, the bodies moved, and one relaxing
+/// pass taking the pushing back out of the velocities. Which pairs touch,
+/// and where, is found once per step, before the substeps - that is the
+/// expensive part, and a substep's worth of movement does not change it.
+///
+/// Why substeps and not more passes: a pass works on a picture of the
+/// world, and the picture is taken when the pass starts. Eight passes over
+/// one picture of a chain holding a heavy weight solve, very precisely, the
+/// chain as it was - and the weight has moved on. Four substeps take four
+/// pictures, each of the world as it is. A crate ten times a plank's weight
+/// dropped on a light bridge tore the pins 60 pixels apart the first way;
+/// see `joint_test` for what it does now. Erin Catto's "soft step", Box2D
+/// v3's solver.
 pub fn step(self: *World, dt: f32, jobs: *Jobs) Error!void {
     if (dt <= 0) return;
     const gpa = self.gpa;
     const units = self.settings.units_per_metre;
+    const substeps = @max(self.settings.substeps, 1);
+    const h = dt / @as(f32, @floatFromInt(substeps));
+    const inv_h = 1 / h;
+    // A spring faster than a quarter of the substep rate is one the
+    // substeps cannot follow; Box2D v3's cap.
+    const fastest = 0.25 * inv_h;
+    const contact_hertz = @min(self.settings.contact_hertz, fastest);
+    const joint_hertz = @min(self.settings.joint_hertz, fastest);
+    const joint_step: joint_mod.Step = .{
+        .dt = h,
+        .inv_dt = inv_h,
+        .stiffness = if (joint_hertz > 0) .of(joint_hertz, self.settings.joint_damping_ratio, h) else .rigid,
+        .slop = self.settings.linear_slop * units,
+        .units_per_metre = units,
+    };
+    var joint_relax = joint_step;
+    joint_relax.stiffness = .rigid;
     const ctx: Step = .{
         .world = self,
         .dt = dt,
-        .inv_dt = 1 / dt,
-        .joint = .{
-            .dt = dt,
-            .inv_dt = 1 / dt,
-            .stiffness = if (self.settings.joint_hertz > 0)
-                .of(.{ .hertz = self.settings.joint_hertz, .damping_ratio = self.settings.joint_damping_ratio }, dt)
-            else
-                .baumgarte(0, 1 / dt),
-            .max_push = self.settings.max_push_speed * units,
+        .h = h,
+        .inv_h = inv_h,
+        .contact = .{
+            .inv_h = inv_h,
             .slop = self.settings.linear_slop * units,
-            .units_per_metre = units,
+            .max_push = self.settings.max_push_speed * units,
         },
+        .contact_softness = .of(contact_hertz, self.settings.contact_damping_ratio, h),
+        .static_softness = .of(2 * contact_hertz, self.settings.contact_damping_ratio, h),
+        .joint = joint_step,
+        .joint_relax = joint_relax,
+        .max_speed = self.settings.max_speed * units,
+        .max_turn = 0.25 * std.math.pi,
     };
-    self.inv_dt = ctx.inv_dt;
+    self.inv_h = inv_h;
 
     const body_slots = self.bodies.slotCount();
     const shape_slots = self.shapes.slotCount();
     try self.aabbs.resize(gpa, shape_slots);
 
-    // 0. Sleepers a joint is asking to move, woken before anything looks.
+    // 0. Sleepers a joint is asking to move, or somebody has pushed, woken
+    //    before anything looks.
     self.wakeDrivenJoints();
+    solver.forRange(jobs, body_slots, grain_bodies, &ctx, wakePushed);
 
-    // 1. Forces into velocities.
-    solver.forRange(jobs, body_slots, grain_bodies, &ctx, integrateVelocities);
-
-    // 2. Where every moving shape is.
+    // 1. Where every moving shape is.
     solver.forRange(jobs, shape_slots, grain_bodies, &ctx, updateAabbs);
 
-    // 3. Which boxes overlap.
+    // 2. Which boxes overlap.
     self.pairs.clearRetainingCapacity();
     try self.sweep.update(gpa, self.aabbs.items, self, acceptPair, &self.pairs);
 
-    // 4. Where each pair touches.
+    // 3. Where each pair touches.
     try self.manifolds.resize(gpa, self.pairs.items.len);
     solver.forRange(jobs, self.pairs.items.len, grain_pairs, &ctx, narrowPhase);
 
-    // 5. Contacts into constraints, remembering what is touching.
+    // 4. Contacts into constraints, remembering what is touching.
     try self.prepareContacts(ctx);
 
-    // 6. The joints that can move something, each made ready.
+    // 5. The joints that can move something.
     try self.gatherJoints();
-    solver.forRange(jobs, self.joint_refs.items.len, grain_joints, &ctx, prepareJoints);
 
-    // 7. Both into runs that share no movable body.
+    // 6. Both into runs that share no movable body.
     try self.colouring.assign(gpa, self.constraints.items, body_slots);
     try self.joint_colouring.assign(gpa, self.joint_refs.items, body_slots);
 
-    // 8. Warm start, then the passes: each is the joints colour by colour,
-    //    then the contacts. Every colour is a fork and a join; the
-    //    overflows are walked here.
-    self.warmStartAll(jobs, &ctx);
-    for (0..self.settings.velocity_iterations) |_| self.solveAll(jobs, &ctx);
+    // 7. The substeps. Each pass is the joints colour by colour, then the
+    //    contacts; every colour is a fork and a join, and the overflows are
+    //    walked here. The joints are measured before the first pass and
+    //    again after every move, so the relaxing and the next substep both
+    //    see where the bodies are.
+    solver.forRange(jobs, self.joint_refs.items.len, grain_joints, &ctx, prepareJoints);
+    for (0..substeps) |_| {
+        solver.forRange(jobs, body_slots, grain_bodies, &ctx, integrateVelocities);
+        self.warmStartAll(jobs, &ctx);
+        self.solveAll(jobs, &ctx, .solve);
+        solver.forRange(jobs, body_slots, grain_bodies, &ctx, integratePositions);
+        solver.forRange(jobs, self.joint_refs.items.len, grain_joints, &ctx, prepareJoints);
+        self.solveAll(jobs, &ctx, .relax);
+    }
 
-    // 9. The pushing apart, on the push velocities. See `contact`.
-    for (0..self.settings.push_iterations) |_| self.pushAll(jobs, &ctx);
+    // 8. Bounce, and forget the forces, which pushed for the whole step.
+    self.restituteAll(jobs, &ctx);
+    solver.forRange(jobs, body_slots, grain_bodies, &ctx, clearForces);
 
-    // 10. Velocities and pushes into positions.
-    solver.forRange(jobs, body_slots, grain_bodies, &ctx, integratePositions);
-
-    // 11. What to remember, and what changed.
+    // 9. What to remember, and what changed.
     try self.rememberContacts();
 
-    // 12. Which islands rest, and which wake.
+    // 10. Which islands rest, and which wake.
     try self.updateSleep(dt);
     self.step_count += 1;
 }
@@ -707,32 +770,53 @@ fn wakeDrivenJoints(self: *World) void {
     }
 }
 
-fn integrateVelocities(ctx: *const Step, begin: usize, end: usize) void {
+/// A sleeper that somebody has pushed since it fell asleep - or that may
+/// not sleep any more - wakes. Alone: its island follows at the end of the
+/// step.
+fn wakePushed(ctx: *const Step, begin: usize, end: usize) void {
     const world = ctx.world;
-    const dt = ctx.dt;
     for (world.bodies.slots.items[begin..end]) |*slot| {
         const b = &(slot.value orelse continue);
-        if (b.type != .dynamic) continue;
-        // Every step's pushing starts from nothing - a sleeper's too, since
-        // a contact with something awake may push it before it wakes.
-        b.push_velocity = .zero;
-        b.push_angular = 0;
-        if (!b.awake) {
-            // Asleep - unless somebody has pushed it since, or sleeping is
-            // no longer allowed. A body wakes alone here; its island follows
-            // at the end of the step.
-            if (b.isPushed() or !b.allow_sleep or !world.settings.enable_sleep) b.wake() else continue;
-        }
+        if (b.type != .dynamic or b.awake) continue;
+        if (b.isPushed() or !b.allow_sleep or !world.settings.enable_sleep) b.wake();
+    }
+}
+
+/// One substep's worth of gravity, forces and damping.
+fn integrateVelocities(ctx: *const Step, begin: usize, end: usize) void {
+    const world = ctx.world;
+    const h = ctx.h;
+    for (world.bodies.slots.items[begin..end]) |*slot| {
+        const b = &(slot.value orelse continue);
+        if (b.type != .dynamic or !b.awake) continue;
 
         const acceleration = world.gravity.scale(b.gravity_scale).mulAdd(b.force, b.inv_mass);
-        b.linear_velocity = b.linear_velocity.mulAdd(acceleration, dt);
-        b.angular_velocity += dt * b.inv_inertia * b.torque;
+        b.linear_velocity = b.linear_velocity.mulAdd(acceleration, h);
+        b.angular_velocity += h * b.inv_inertia * b.torque;
 
-        // Damping as `v /= 1 + c dt`, which is stable for any `c` and any
-        // `dt`, where `v *= 1 - c dt` goes negative for a big enough step.
-        b.linear_velocity = b.linear_velocity.scale(1 / (1 + dt * b.linear_damping));
-        b.angular_velocity *= 1 / (1 + dt * b.angular_damping);
+        // Damping as `v /= 1 + c h`, which is stable for any `c` and any
+        // `h`, where `v *= 1 - c h` goes negative for a big enough step.
+        b.linear_velocity = b.linear_velocity.scale(1 / (1 + h * b.linear_damping));
+        b.angular_velocity *= 1 / (1 + h * b.angular_damping);
 
+        // Past a quarter turn a substep, a joint's or a contact's lever arm
+        // has swung too far for the solver's straight-line picture of it to
+        // be any use, and a light link whipped by a heavy weight spins
+        // itself apart. Box2D's limit; at four substeps of a sixtieth it is
+        // thirty turns a second, which nothing a game means to do reaches.
+        const turn = h * b.angular_velocity;
+        if (@abs(turn) > ctx.max_turn) b.angular_velocity *= ctx.max_turn / @abs(turn);
+        const speed_sq = b.linear_velocity.lenSq();
+        if (speed_sq > ctx.max_speed * ctx.max_speed) {
+            b.linear_velocity = b.linear_velocity.scale(ctx.max_speed / @sqrt(speed_sq));
+        }
+    }
+}
+
+/// Forces push for a whole step, every substep of it, and are then gone.
+fn clearForces(ctx: *const Step, begin: usize, end: usize) void {
+    for (ctx.world.bodies.slots.items[begin..end]) |*slot| {
+        const b = &(slot.value orelse continue);
         b.force = .zero;
         b.torque = 0;
     }
@@ -812,15 +896,6 @@ fn prepareContacts(self: *World, ctx: Step) Error!void {
     self.contacts.clearRetainingCapacity();
     self.links.clearRetainingCapacity();
 
-    const units = self.settings.units_per_metre;
-    const bias: contact.Bias = .{
-        .baumgarte = self.settings.baumgarte,
-        .inv_dt = ctx.inv_dt,
-        .slop = self.settings.linear_slop * units,
-        .restitution_threshold = self.settings.restitution_threshold * units,
-        .max_push_speed = self.settings.max_push_speed * units,
-    };
-
     for (self.pairs.items, self.manifolds.items) |pair, *m| {
         if (m.count == 0) continue;
         const slot_a = &self.shapes.slots.items[pair.a];
@@ -855,7 +930,8 @@ fn prepareContacts(self: *World, ctx: Step) Error!void {
             ea.def.material,
             eb.def.material,
             warm,
-            bias,
+            ctx.contact_softness,
+            ctx.static_softness,
         ));
     }
 
@@ -953,15 +1029,17 @@ const Run = struct {
     constraints: []contact.Constraint,
 };
 
-/// One colour's joints, the same.
+/// One colour's joints, the same, with the step they are solved at -
+/// their spring, or rigid while relaxing.
 const JointRun = struct {
     step: *const Step,
+    joint_step: joint_mod.Step,
     refs: []joint_mod.Ref,
 };
 
 fn warmStartAll(self: *World, jobs: *Jobs, ctx: *const Step) void {
     for (0..solver.max_colours) |colour| {
-        const run: JointRun = .{ .step = ctx, .refs = self.joint_colouring.run(colour) };
+        const run: JointRun = .{ .step = ctx, .joint_step = ctx.joint, .refs = self.joint_colouring.run(colour) };
         solver.forRange(jobs, run.refs.len, grain_joints, &run, warmStartJointRun);
     }
     self.warmStartJointsHere(self.joint_colouring.run(solver.overflow));
@@ -972,27 +1050,29 @@ fn warmStartAll(self: *World, jobs: *Jobs, ctx: *const Step) void {
     self.warmStartRunHere(self.colouring.run(solver.overflow));
 }
 
-fn solveAll(self: *World, jobs: *Jobs, ctx: *const Step) void {
+/// One pass over everything: the joints colour by colour, then the
+/// contacts. `pass` says whether it is the pushing pass or the relaxing one.
+fn solveAll(self: *World, jobs: *Jobs, ctx: *const Step, comptime pass: contact.Pass) void {
+    const joint_step = if (pass == .solve) ctx.joint else ctx.joint_relax;
     for (0..solver.max_colours) |colour| {
-        const run: JointRun = .{ .step = ctx, .refs = self.joint_colouring.run(colour) };
+        const run: JointRun = .{ .step = ctx, .joint_step = joint_step, .refs = self.joint_colouring.run(colour) };
         solver.forRange(jobs, run.refs.len, grain_joints, &run, solveJointRun);
     }
-    self.solveJointsHere(self.joint_colouring.run(solver.overflow), ctx.joint);
-    self.contactPass(jobs, ctx, .solve);
-}
-
-/// A push pass: contacts only. A joint's drift goes back through its own
-/// bias, which a pendulum shows costs it almost nothing - see `joint`.
-fn pushAll(self: *World, jobs: *Jobs, ctx: *const Step) void {
-    self.contactPass(jobs, ctx, .push);
-}
-
-fn contactPass(self: *World, jobs: *Jobs, ctx: *const Step, comptime pass: contact.Pass) void {
+    self.solveJointsHere(self.joint_colouring.run(solver.overflow), joint_step);
     for (0..solver.max_colours) |colour| {
         const run: Run = .{ .step = ctx, .constraints = self.colouring.run(colour) };
         solver.forRange(jobs, run.constraints.len, grain_contacts, &run, solveRun(pass));
     }
-    self.solveRunHere(self.colouring.run(solver.overflow), pass);
+    self.solveRunHere(self.colouring.run(solver.overflow), ctx.contact, pass);
+}
+
+/// Restitution, contact by contact. Joints do not bounce.
+fn restituteAll(self: *World, jobs: *Jobs, ctx: *const Step) void {
+    for (0..solver.max_colours) |colour| {
+        const run: Run = .{ .step = ctx, .constraints = self.colouring.run(colour) };
+        solver.forRange(jobs, run.constraints.len, grain_contacts, &run, restituteRun);
+    }
+    self.restituteRunHere(self.colouring.run(solver.overflow));
 }
 
 fn warmStartRun(run: *const Run, begin: usize, end: usize) void {
@@ -1004,22 +1084,31 @@ fn warmStartRun(run: *const Run, begin: usize, end: usize) void {
 /// A job is a plain function, and `forRange` wants it at compile time, but
 /// which pass it makes is a parameter. So this is a function that *makes*
 /// the function: the struct inside is a fresh type for each `pass`, its
-/// `go` sees `pass` as a constant, and `solveRun(.push)` is as much a
+/// `go` sees `pass` as a constant, and `solveRun(.relax)` is as much a
 /// compile-time value as a function written out by hand would be.
 fn solveRun(comptime pass: contact.Pass) fn (*const Run, usize, usize) void {
     return struct {
         fn go(run: *const Run, begin: usize, end: usize) void {
-            run.step.world.solveRunHere(run.constraints[begin..end], pass);
+            run.step.world.solveRunHere(run.constraints[begin..end], run.step.contact, pass);
         }
     }.go;
+}
+
+fn restituteRun(run: *const Run, begin: usize, end: usize) void {
+    run.step.world.restituteRunHere(run.constraints[begin..end]);
 }
 
 fn warmStartRunHere(self: *World, constraints: []contact.Constraint) void {
     for (constraints) |*c| contact.warmStart(c, self.bodyAt(c.body_a), self.bodyAt(c.body_b));
 }
 
-fn solveRunHere(self: *World, constraints: []contact.Constraint, comptime pass: contact.Pass) void {
-    for (constraints) |*c| contact.solve(c, self.bodyAt(c.body_a), self.bodyAt(c.body_b), pass);
+fn solveRunHere(self: *World, constraints: []contact.Constraint, contact_step: contact.Step, comptime pass: contact.Pass) void {
+    for (constraints) |*c| contact.solve(c, self.bodyAt(c.body_a), self.bodyAt(c.body_b), contact_step, pass);
+}
+
+fn restituteRunHere(self: *World, constraints: []contact.Constraint) void {
+    const threshold = self.settings.restitution_threshold * self.settings.units_per_metre;
+    for (constraints) |*c| contact.restitute(c, self.bodyAt(c.body_a), self.bodyAt(c.body_b), threshold);
 }
 
 fn warmStartJointRun(run: *const JointRun, begin: usize, end: usize) void {
@@ -1027,7 +1116,7 @@ fn warmStartJointRun(run: *const JointRun, begin: usize, end: usize) void {
 }
 
 fn solveJointRun(run: *const JointRun, begin: usize, end: usize) void {
-    run.step.world.solveJointsHere(run.refs[begin..end], run.step.joint);
+    run.step.world.solveJointsHere(run.refs[begin..end], run.joint_step);
 }
 
 fn warmStartJointsHere(self: *World, refs: []const joint_mod.Ref) void {
@@ -1038,16 +1127,16 @@ fn solveJointsHere(self: *World, refs: []const joint_mod.Ref, joint_step: joint_
     for (refs) |ref| joint_mod.solve(self.jointAt(ref.joint), self.bodyAt(ref.body_a), self.bodyAt(ref.body_b), joint_step);
 }
 
+/// One substep's worth of movement.
 fn integratePositions(ctx: *const Step, begin: usize, end: usize) void {
-    const dt = ctx.dt;
+    const h = ctx.h;
     for (ctx.world.bodies.slots.items[begin..end]) |*slot| {
         const b = &(slot.value orelse continue);
         // Whatever `setTransform` changed has been looked at by now.
         b.teleported = false;
         if (b.type == .static or !b.awake) continue;
-        // The push moves it this once, and is not kept.
-        b.center = b.center.mulAdd(b.linear_velocity.add(b.push_velocity), dt);
-        b.angle += dt * (b.angular_velocity + b.push_angular);
+        b.center = b.center.mulAdd(b.linear_velocity, h);
+        b.angle += h * b.angular_velocity;
         b.syncTransform();
     }
 }

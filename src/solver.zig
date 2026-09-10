@@ -203,6 +203,7 @@ fn fakeConstraint(a: u32, b: u32, a_moves: bool, b_moves: bool) Constraint {
         .inv_mass_b = if (b_moves) 1 else 0,
         .inv_inertia_a = 0,
         .inv_inertia_b = 0,
+        .softness = .{},
         .points = undefined,
         .count = 0,
     };

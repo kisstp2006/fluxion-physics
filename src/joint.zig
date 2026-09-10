@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+﻿// SPDX-License-Identifier: BSD-2-Clause
 
 //! Joints: two bodies held to each other, or one body pulled to a point.
 //!
@@ -44,28 +44,35 @@
 //!
 //! **Solved beside the contacts, and the same way.** A joint is a few
 //! velocity constraints between two bodies, solved by sequential impulses
-//! and warm-started from what it pushed last step, exactly as a contact is.
-//! The colouring treats it the same too: joints get colours of their own,
-//! a colour's joints are solved at once, and every pass does the joints
-//! colour by colour and then the contacts. The answer does not depend on
-//! how many cores there are, for the same reason the contacts' does not.
+//! and warm-started from what it pushed the substep before, exactly as a
+//! contact is. The colouring treats it the same too: joints get colours of
+//! their own, a colour's joints are solved at once, and every pass does the
+//! joints colour by colour and then the contacts. The answer does not
+//! depend on how many cores there are, for the same reason the contacts'
+//! does not.
+//!
+//! **Measured again every substep.** A joint's lever arms turn with its
+//! bodies, so `prepare` runs before the first substep and again after every
+//! move: each pass sees the joint as it is, not as it was when the step
+//! began. That, more than anything, is what lets a light chain hold a
+//! heavy weight: see `World.step`, and the scenes under load at the end of
+//! `joint_test`.
 //!
 //! **Drift is taken back the way a stiff spring would take it back**,
-//! heavily damped, because this package has no position pass and the
-//! plainer way - a fixed fraction of the drift, fed back as a velocity -
-//! pumps energy into a light chain holding a heavy weight until it flies
-//! apart. `Step.rigid` has the measurements and the arithmetic;
-//! `Settings.joint_hertz` the knob. A long chain under a heavy load
-//! stretches a little and comes back; Box2D's position pass would hold it
-//! tighter, and is what to add if that is ever not good enough.
+//! heavily damped, then taken back out of the velocity by a relaxing pass -
+//! because the plainer way, a fixed fraction of the drift fed back as a
+//! velocity, pumps energy into a light chain holding a heavy weight until
+//! it flies apart. `Step.rigid` has the reasons, `Softness` the arithmetic,
+//! `Settings.joint_hertz` the knob.
 //!
-//! **Springs are soft constraints**, Erin Catto's trick ("Soft Step", 2011,
-//! and Box2D since): a spring of a given frequency and damping ratio is a
-//! constraint that is allowed to be violated by exactly as much as the
-//! spring would stretch, so it is solved in the same loop as everything
-//! rigid and cannot blow up however stiff it is set. Given in hertz and not
-//! in newtons per metre, because a frequency means the same for a crate as
-//! for a car, and a stiffness has to be retuned whenever a mass changes.
+//! **Springs are soft constraints**, Erin Catto's trick ("Soft
+//! Constraints", GDC 2011, and Box2D since): a spring of a given frequency
+//! and damping ratio is a constraint that is allowed to be violated by
+//! exactly as much as the spring would stretch, so it is solved in the same
+//! loop as everything rigid and cannot blow up however stiff it is set.
+//! Given in hertz and not in newtons per metre, because a frequency means
+//! the same for a crate as for a car, and a stiffness has to be retuned
+//! whenever a mass changes.
 //!
 //! **Two bodies held by a joint do not collide with each other** unless the
 //! definition says `collide_connected`. A joint usually holds two shapes
@@ -102,6 +109,11 @@ pub const Spring = struct {
     /// Pushes nothing: a distance joint with a slack spring is held only by
     /// its limits, which is a rope.
     pub const slack: Spring = .{};
+
+    /// As the solver steps it, `h` seconds at a time.
+    pub fn softness(self: Spring, h: f32) Softness {
+        return .of(self.hertz, self.damping_ratio, h);
+    }
 };
 
 /// How far a joint may go each way from where it was made: radians for a
@@ -430,15 +442,15 @@ pub const Ref = struct {
 // Solving, for every kind
 // -------------------------------------------------------------------------
 
-/// What a step tells every joint, worked out once.
+/// What a substep tells every joint, worked out once per step.
 pub const Step = struct {
+    /// The substep, not the whole step: every impulse a joint keeps is the
+    /// impulse of one substep. See `World.step`.
     dt: f32,
     inv_dt: f32,
-    /// How every rigid constraint takes back its drift. See `rigid`.
+    /// How every rigid constraint takes back its drift: the joint spring
+    /// while solving, `Softness.rigid` while relaxing. See `rigid`.
     stiffness: Softness,
-    /// The fastest a drifted joint is pulled back, in world units per
-    /// second. See `Settings.max_push_speed`.
-    max_push: f32,
     /// Shorter than this, a distance has no direction. World units.
     slop: f32,
     /// For the mouse joint's default force.
@@ -450,40 +462,35 @@ pub const Step = struct {
     ///
     /// **Rigid, but with a spring's damping in how it takes back drift.**
     /// The plain way - ask for a fixed fraction of the drift back, as a
-    /// velocity, every step - puts the correction into the bodies as real
-    /// speed. When the solver converges that is harmless; when it does not -
-    /// a heavy weight on a light chain, where eight passes are not enough to
-    /// carry the weight up the links - each step's correction overshoots a
-    /// little, the next is fed from the overshoot, and the chain gains energy
-    /// until it flies apart. Measured, not guessed: a ball six times a link's
-    /// mass on ten links pulled its pins 90 pixels apart in five seconds.
+    /// velocity - puts the correction into the bodies as real speed, and
+    /// when the solver has not converged each correction overshoots and the
+    /// next is fed from the overshoot: a ball six times a link's mass on ten
+    /// links pulled its pins 90 pixels apart in five seconds that way. So
+    /// the drift is taken back the way a very stiff, heavily damped spring
+    /// would (`Settings.joint_hertz`); see `Softness` for why that cannot
+    /// add energy.
     ///
-    /// So the drift is taken back the way a very stiff, heavily damped
-    /// spring would take it back (`Settings.joint_hertz`). The arithmetic is
-    /// `Softness`'s: an implicit spring step, which cannot add energy
-    /// however stiff it is set, and whose `impulse_scale` term lets a little
-    /// of the accumulated impulse go every pass - the damping. Box2D v3's
-    /// joints are built the same way.
+    /// **And never capped.** A contact's push is capped, so a body made
+    /// inside another does not leave at the speed of a bullet; a joint's is
+    /// not, because a joint that has been pulled apart - a chain yanked by
+    /// the weight on its end - has to be able to come back together faster
+    /// than the weight is pulling it apart. Capped, it could not, and the
+    /// chain came apart for good. The spring's damping is what keeps an
+    /// uncapped correction gentle.
     fn rigid(self: Step, mass: f32, cdot: f32, c: f32, total: f32) f32 {
-        const s = self.stiffness;
-        const bias = std.math.clamp(s.bias_rate * c, -self.max_push, self.max_push);
-        return -s.mass_scale * mass * (cdot + bias) - s.impulse_scale * total;
+        return self.stiffness.impulse(mass, cdot, c, total);
     }
 
-    /// The same about an angle, which has no speed limit to share with the
-    /// linear ones: half a turn back at the rate the spring allows is
-    /// already a gentle correction.
+    /// The same about an angle.
     fn rigidAngle(self: Step, mass: f32, cdot: f32, c: f32, total: f32) f32 {
-        const s = self.stiffness;
-        return -s.mass_scale * mass * (cdot + s.bias_rate * c) - s.impulse_scale * total;
+        return self.stiffness.impulse(mass, cdot, c, total);
     }
 
     /// The same at a point, both directions at once. `matrix` is the
     /// point's effective mass matrix, not yet inverted.
     fn rigidPoint(self: Step, matrix: Sym22, cdot: Vec2, c: Vec2, total: Vec2) Vec2 {
         const s = self.stiffness;
-        const bias = c.scale(s.bias_rate).clampLen(self.max_push);
-        return matrix.solve(cdot.add(bias)).scale(-s.mass_scale).sub(total.scale(s.impulse_scale));
+        return matrix.solve(cdot.add(c.scale(s.bias_rate))).scale(-s.mass_scale).sub(total.scale(s.impulse_scale));
     }
 
     /// A one-sided limit. Short of the stop by `c > 0`, the gap may be
@@ -552,44 +559,9 @@ pub const Velocities = struct {
     }
 };
 
-/// A spring as the solver uses it: three numbers that turn a rigid
-/// constraint's impulse into a spring's. See the module comment.
-pub const Softness = struct {
-    /// How much of the error is asked back, as a velocity, per unit of it.
-    bias_rate: f32 = 0,
-    /// How much of a rigid constraint's impulse is applied.
-    mass_scale: f32 = 0,
-    /// How much of what was already applied is taken back each pass: the
-    /// give that makes it a spring and not a rod.
-    impulse_scale: f32 = 0,
-
-    /// Box2D v3's `b2MakeSoft`. The arithmetic is the implicit Euler step
-    /// of a damped spring, rearranged so that the spring's stiffness and
-    /// damping never appear on their own and so cannot be too big for the
-    /// step. A spring of zero hertz is all zeros, and pushes nothing.
-    pub fn of(spring: Spring, dt: f32) Softness {
-        if (spring.hertz <= 0) return .{};
-        const omega = 2 * std.math.pi * spring.hertz;
-        const a1 = 2 * spring.damping_ratio + dt * omega;
-        const a2 = dt * omega * a1;
-        const a3 = 1 / (1 + a2);
-        return .{ .bias_rate = omega / a1, .mass_scale = a2 * a3, .impulse_scale = a3 };
-    }
-
-    /// Rigid, taking back `fraction` of the drift per step as a velocity:
-    /// Baumgarte's way, with none of a spring's give. What a joint was
-    /// before it was soft, kept for the tests that check a pass against
-    /// numbers worked out by hand.
-    pub fn baumgarte(fraction: f32, inv_dt: f32) Softness {
-        return .{ .bias_rate = fraction * inv_dt, .mass_scale = 1, .impulse_scale = 0 };
-    }
-
-    /// The impulse a soft constraint with effective mass `mass`, speed
-    /// `cdot` and error `c` asks for this pass, given `total` so far.
-    inline fn impulse(s: Softness, mass: f32, cdot: f32, c: f32, total: f32) f32 {
-        return -s.mass_scale * mass * (cdot + s.bias_rate * c) - s.impulse_scale * total;
-    }
-};
+/// A spring as the solver uses it. See `Softness` itself, which the
+/// contacts share.
+pub const Softness = @import("Softness.zig");
 
 /// A symmetric 2x2 matrix: what one unit of impulse at a point does to the
 /// velocity of that point, in each direction.
@@ -724,7 +696,7 @@ pub const Distance = struct {
         // a rod of no length is a pin: see `revolute`.
         self.axis = if (self.current > step.slop) d.scale(1 / self.current) else .zero;
         self.axial_mass = axialMass(m, cross(self.ra, self.axis), cross(self.rb, self.axis));
-        self.softness = if (self.spring) |s| .of(s, step.dt) else .{};
+        self.softness = if (self.spring) |s| s.softness(step.dt) else .{};
         // A limit that is not there any more pushes nothing, including in
         // the warm start.
         if (self.spring == null or self.min_length <= 0) self.lower_impulse = 0;
@@ -815,7 +787,7 @@ pub const Revolute = struct {
         self.separation = b.center.add(self.rb).sub(a.center.add(self.ra));
         self.angle = b.angle - a.angle - self.reference_angle;
         self.axial_mass = if (m.ia + m.ib > 0) 1 / (m.ia + m.ib) else 0;
-        self.softness = if (self.spring) |s| .of(s, step.dt) else .{};
+        self.softness = if (self.spring) |s| s.softness(step.dt) else .{};
 
         // What has been switched off since last step pushes nothing now.
         if (self.limit == null) {
@@ -935,7 +907,7 @@ pub const Prismatic = struct {
         self.translation = self.axis.dot(d);
         self.perp_error = self.perp.dot(d);
         self.angle_error = b.angle - a.angle - self.reference_angle;
-        self.softness = if (self.spring) |s| .of(s, step.dt) else .{};
+        self.softness = if (self.spring) |s| s.softness(step.dt) else .{};
 
         if (self.limit == null) {
             self.lower_impulse = 0;
@@ -989,10 +961,7 @@ pub const Prismatic = struct {
             .x = self.perp.dot(v.vb.sub(v.va)) + self.s2 * v.wb - self.s1 * v.wa,
             .y = v.wb - v.wa,
         };
-        const bias: Vec2 = .{
-            .x = std.math.clamp(s.bias_rate * self.perp_error, -step.max_push, step.max_push),
-            .y = s.bias_rate * self.angle_error,
-        };
+        const bias: Vec2 = .{ .x = s.bias_rate * self.perp_error, .y = s.bias_rate * self.angle_error };
         const impulse = self.matrix.solve(cdot.add(bias)).scale(-s.mass_scale).sub(self.impulse.scale(s.impulse_scale));
         self.impulse = self.impulse.add(impulse);
         v.pushWith(m, self.perp.scale(impulse.x), impulse.x * self.s1 + impulse.y, impulse.x * self.s2 + impulse.y);
@@ -1038,8 +1007,8 @@ pub const Weld = struct {
         self.separation = b.center.add(self.rb).sub(a.center.add(self.ra));
         self.angle_error = b.angle - a.angle - self.reference_angle;
         self.axial_mass = if (m.ia + m.ib > 0) 1 / (m.ia + m.ib) else 0;
-        self.linear_softness = if (self.linear_spring) |s| .of(s, step.dt) else .{};
-        self.angular_softness = if (self.angular_spring) |s| .of(s, step.dt) else .{};
+        self.linear_softness = if (self.linear_spring) |s| s.softness(step.dt) else .{};
+        self.angular_softness = if (self.angular_spring) |s| s.softness(step.dt) else .{};
     }
 
     fn warmStart(self: *const Weld, m: Masses, v: *Velocities) void {
@@ -1109,8 +1078,8 @@ pub const Mouse = struct {
         self.rb = arm(b, self.local_anchor);
         self.matrix = .point(m, .zero, self.rb);
         self.separation = b.center.add(self.rb).sub(self.target);
-        self.softness = .of(self.spring, step.dt);
-        self.angular_softness = .of(spin_damping, step.dt);
+        self.softness = self.spring.softness(step.dt);
+        self.angular_softness = spin_damping.softness(step.dt);
         self.angular_mass = if (m.ib > 0) 1 / m.ib else 0;
         const force = self.max_force orelse 1000 * b.mass * step.units_per_metre;
         self.max_impulse = force * step.dt;
@@ -1201,7 +1170,7 @@ pub const Wheel = struct {
 
         self.translation = self.axis.dot(d);
         self.perp_error = self.perp.dot(d);
-        self.softness = if (self.spring) |s| .of(s, step.dt) else .{};
+        self.softness = if (self.spring) |s| s.softness(step.dt) else .{};
 
         if (self.limit == null) {
             self.lower_impulse = 0;
@@ -1276,7 +1245,6 @@ const test_step: Step = .{
     .dt = 1.0 / 60.0,
     .inv_dt = 60,
     .stiffness = .baumgarte(0.2, 60),
-    .max_push = 3,
     .slop = 0.005,
     .units_per_metre = 1,
 };
@@ -1304,21 +1272,6 @@ fn run(def: Def, a: *Body, b: *Body, passes: usize) Joint {
     warmStart(&j, a, b);
     for (0..passes) |_| solve(&j, a, b, test_step);
     return j;
-}
-
-test "a spring of zero hertz is nothing, and a stiff one is nearly a rod" {
-    const none: Softness = .of(.slack, 1.0 / 60.0);
-    try testing.expectEqual(@as(f32, 0), none.mass_scale);
-    try testing.expectEqual(@as(f32, 0), none.impulse(1, 5, 5, 5));
-
-    const stiff: Softness = .of(.{ .hertz = 1000, .damping_ratio = 1 }, 1.0 / 60.0);
-    try testing.expect(stiff.mass_scale > 0.99);
-    try testing.expect(stiff.impulse_scale < 0.01);
-
-    // Softer springs give way more: less of the rigid impulse, more taken back.
-    const soft: Softness = .of(.{ .hertz = 2, .damping_ratio = 0.5 }, 1.0 / 60.0);
-    try testing.expect(soft.mass_scale < stiff.mass_scale);
-    try testing.expect(soft.impulse_scale > stiff.impulse_scale);
 }
 
 test "a pin stops two bodies moving apart at it, and leaves them free to turn" {

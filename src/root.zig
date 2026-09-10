@@ -83,6 +83,10 @@ pub const Limit = joint.Limit;
 pub const AngularMotor = joint.AngularMotor;
 pub const LinearMotor = joint.LinearMotor;
 
+/// A spring as the solver steps it: how every contact and joint takes back
+/// what it drifts. See `Softness` itself for why.
+pub const Softness = @import("Softness.zig");
+
 pub const Settings = World.Settings;
 pub const ContactEvent = World.ContactEvent;
 pub const RayHit = World.RayHit;
@@ -106,6 +110,7 @@ test {
     _ = Body;
     _ = shape;
     _ = joint;
+    _ = Softness;
     _ = collide;
     _ = broadphase;
     _ = contact;
