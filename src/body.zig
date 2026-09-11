@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: BSD-2-Clause
 
 //! A rigid body: where it is, how it moves, and what it weighs.
 //!
@@ -81,6 +81,13 @@ pub const Def = struct {
     /// notice the first frame of the next press. A body that may not sleep
     /// keeps everything it touches awake too.
     allow_sleep: bool = true,
+    /// Swept against other moving bodies too, not only the level, so it
+    /// cannot pass through a crate or a plank between one step and the
+    /// next. For small, fast things meant to hit other moving things: a
+    /// bullet, a thrown knife. Every fast body is swept against the level
+    /// whatever this says; see `World` for what continuous collision does.
+    /// Two bullets do not see each other.
+    bullet: bool = false,
     /// Yours. The body never reads it.
     user_data: u64 = 0,
 };
@@ -111,6 +118,8 @@ angular_damping: f32,
 gravity_scale: f32,
 fixed_rotation: bool,
 allow_sleep: bool,
+/// See `Def.bullet`. May be changed at any time.
+bullet: bool,
 user_data: u64,
 /// False while asleep. Only ever false for a dynamic body.
 awake: bool = true,
@@ -125,6 +134,18 @@ teleported: bool = false,
 /// furthest edge by, for deciding whether it is still. Kept by
 /// `World.updateMass`.
 extent: f32 = 0,
+/// How thin its thinnest shape is, from that shape's middle to its nearest
+/// edge. A body that moves more than half of this in a step is swept for
+/// what it could have passed through. Kept by `World.updateMass`.
+min_extent: f32 = 0,
+/// Where the centre of mass was, and the angle, when the step began: the
+/// start of the path the continuous pass sweeps. Written by the step.
+center0: Vec2 = .zero,
+angle0: f32 = 0,
+/// The continuous pass stopped it short last step, where it first touched
+/// something, still moving towards it. This step looks a little ahead of
+/// it for what it touches, so the solver sees what it is about to hit.
+stopped_short: bool = false,
 /// The head of the list of shapes on this body. The list is threaded
 /// through the shapes themselves - see `World.ShapeEntry.next`.
 first_shape: ShapeId = .none,
@@ -144,7 +165,10 @@ pub fn fromDef(def: Def) Body {
         .gravity_scale = def.gravity_scale,
         .fixed_rotation = def.fixed_rotation,
         .allow_sleep = def.allow_sleep,
+        .bullet = def.bullet,
         .user_data = def.user_data,
+        .center0 = def.position,
+        .angle0 = def.angle,
     };
 }
 

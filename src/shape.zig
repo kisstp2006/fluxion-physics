@@ -258,6 +258,43 @@ pub const Geometry = union(enum) {
             .polygon => |*p| p.massData(density),
         };
     }
+
+    /// The middle of its area, in the body's frame.
+    pub fn centroid(self: *const Geometry) Vec2 {
+        return switch (self.*) {
+            .circle => |c| c.center,
+            .polygon => |*p| p.massData(1).center,
+        };
+    }
+
+    /// How far it reaches from `from`, a point in the body's frame: the
+    /// radius of the circle about that point that it fits in.
+    pub fn reach(self: *const Geometry, from: Vec2) f32 {
+        return switch (self.*) {
+            .circle => |c| c.center.dist(from) + c.radius,
+            .polygon => |*p| blk: {
+                var far: f32 = 0;
+                for (p.vertexSlice()) |v| far = @max(far, v.dist(from));
+                break :blk far;
+            },
+        };
+    }
+
+    /// How thin it is: the least distance from its centroid to its edge.
+    /// A shape that moves more than about half of this in one step can pass
+    /// through something before a step that only looks at where it ends up
+    /// sees it. See `continuous`.
+    pub fn minExtent(self: *const Geometry) f32 {
+        return switch (self.*) {
+            .circle => |c| c.radius,
+            .polygon => |*p| blk: {
+                const middle = p.massData(1).center;
+                var least = std.math.floatMax(f32);
+                for (p.vertexSlice(), p.normalSlice()) |v, n| least = @min(least, n.dot(v.sub(middle)));
+                break :blk least;
+            },
+        };
+    }
 };
 
 /// How a surface behaves when touched.

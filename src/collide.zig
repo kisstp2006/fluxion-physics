@@ -3,7 +3,7 @@
 //! The narrow phase: given two shapes that might touch, where and how deep.
 //!
 //! ```zig
-//! const m = collide.polygons(&crate, crate_xf, &ramp, ramp_xf);
+//! const m = collide.polygons(&crate, crate_xf, &ramp, ramp_xf, 0);
 //! for (m.points[0..m.count]) |p| { ... p.point, p.separation ... }
 //! ```
 //!
@@ -25,6 +25,14 @@
 //! clipped against it, and the circle cases by regions of a polygon. It is
 //! well understood and its failure modes are known, which for a solver is
 //! worth more than novelty.
+//!
+//! **`margin` reaches a little past touching.** With a margin of zero a
+//! manifold is only ever made of points that are touching or sunk in. With
+//! more, points up to that far apart are kept too, with a positive
+//! separation - *speculative* points, which the solver lets close by the
+//! next substep and no further. The world asks for a margin only for a
+//! body the continuous pass has just stopped short of something, and which
+//! is still moving at it; see `World` for why not for every pair.
 //!
 //! Nothing here allocates, locks or reads anything but its arguments, which
 //! is what lets every pair the broad phase found be tested at the same time
@@ -76,13 +84,13 @@ const eps: f32 = std.math.floatEps(f32);
 // Circle against circle
 // -------------------------------------------------------------------------
 
-pub fn circles(a: Circle, xa: Transform, b: Circle, xb: Transform) Manifold {
+pub fn circles(a: Circle, xa: Transform, b: Circle, xb: Transform, margin: f32) Manifold {
     const pa = xa.apply(a.center);
     const pb = xb.apply(b.center);
     const d = pb.sub(pa);
     const dist_sq = d.lenSq();
     const r = a.radius + b.radius;
-    if (dist_sq > r * r) return .none;
+    if (dist_sq > (r + margin) * (r + margin)) return .none;
 
     const dist = @sqrt(dist_sq);
     // Two circles on exactly the same point have no direction between them.
@@ -104,20 +112,22 @@ pub fn circles(a: Circle, xa: Transform, b: Circle, xb: Transform) Manifold {
 // -------------------------------------------------------------------------
 
 /// The polygon is shape A, so the normal points from it towards the circle.
-pub fn polygonCircle(poly: *const Polygon, xa: Transform, circle: Circle, xb: Transform) Manifold {
+pub fn polygonCircle(poly: *const Polygon, xa: Transform, circle: Circle, xb: Transform, margin: f32) Manifold {
     // The circle's centre in the polygon's frame, where the polygon's
     // normals mean something.
     const c_world = xb.apply(circle.center);
     const c = xa.unapply(c_world);
     const radius = circle.radius;
+    // How far out the centre may be and still make a point.
+    const reach = radius + margin;
 
     // The face the centre is furthest outside of. If it is outside any face
-    // by more than the radius, nothing touches.
+    // by more than that, nothing touches.
     var best: usize = 0;
     var separation: f32 = -std.math.floatMax(f32);
     for (poly.vertexSlice(), poly.normalSlice(), 0..) |v, n, i| {
         const s = n.dot(c.sub(v));
-        if (s > radius) return .none;
+        if (s > reach) return .none;
         if (s > separation) {
             separation = s;
             best = i;
@@ -138,12 +148,12 @@ pub fn polygonCircle(poly: *const Polygon, xa: Transform, circle: Circle, xb: Tr
     // the face itself.
     const along1 = c.sub(v1).dot(v2.sub(v1));
     const along2 = c.sub(v2).dot(v1.sub(v2));
-    if (along1 <= 0) return vertexPoint(xa, c_world, v1, radius, 0x100 | @as(u16, @intCast(best)));
-    if (along2 <= 0) return vertexPoint(xa, c_world, v2, radius, 0x100 | @as(u16, @intCast((best + 1) % poly.count)));
+    if (along1 <= 0) return vertexPoint(xa, c_world, v1, radius, reach, 0x100 | @as(u16, @intCast(best)));
+    if (along2 <= 0) return vertexPoint(xa, c_world, v2, radius, reach, 0x100 | @as(u16, @intCast((best + 1) % poly.count)));
 
     const face_center = v1.add(v2).scale(0.5);
     const s = c.sub(face_center).dot(n_local);
-    if (s > radius) return .none;
+    if (s > reach) return .none;
     return facePoint(c_world, xa.q.rotate(n_local), radius, s, @intCast(best));
 }
 
@@ -160,12 +170,12 @@ fn facePoint(c_world: Vec2, normal: Vec2, radius: f32, distance: f32, feature_id
 }
 
 /// The circle's centre is nearest a corner: the normal runs from the corner
-/// to the centre.
-fn vertexPoint(xa: Transform, c_world: Vec2, v_local: Vec2, radius: f32, feature_id: u16) Manifold {
+/// to the centre. Nothing if the centre is further than `reach` from it.
+fn vertexPoint(xa: Transform, c_world: Vec2, v_local: Vec2, radius: f32, reach: f32, feature_id: u16) Manifold {
     const v = xa.apply(v_local);
     const d = c_world.sub(v);
     const dist_sq = d.lenSq();
-    if (dist_sq > radius * radius) return .none;
+    if (dist_sq > reach * reach) return .none;
     const dist = @sqrt(dist_sq);
     const normal: Vec2 = if (dist > eps) d.scale(1 / dist) else .unit_y;
     var m: Manifold = .{ .normal = normal, .count = 1 };
@@ -298,11 +308,11 @@ fn clipSegment(in: [2]ClipVertex, normal: Vec2, offset: f32, vertex_index_a: usi
 }
 
 /// Two convex polygons. The normal points from A towards B.
-pub fn polygons(a: *const Polygon, xa: Transform, b: *const Polygon, xb: Transform) Manifold {
+pub fn polygons(a: *const Polygon, xa: Transform, b: *const Polygon, xb: Transform, margin: f32) Manifold {
     const from_a = findMaxSeparation(a, xa, b, xb);
-    if (from_a.separation > 0) return .none;
+    if (from_a.separation > margin) return .none;
     const from_b = findMaxSeparation(b, xb, a, xa);
-    if (from_b.separation > 0) return .none;
+    if (from_b.separation > margin) return .none;
 
     // Which polygon supplies the reference face. B's is chosen only when it
     // is clearly better, so a pair whose two candidates are nearly equal
@@ -343,7 +353,7 @@ pub fn polygons(a: *const Polygon, xa: Transform, b: *const Polygon, xb: Transfo
     var m: Manifold = .{ .normal = if (flip) normal.neg() else normal };
     for (second.out) |cp| {
         const separation = normal.dot(cp.v) - front_offset;
-        if (separation <= 0) {
+        if (separation <= margin) {
             m.points[m.count] = .{
                 // The clipped point is on the incident face; move it halfway
                 // to the reference face so the contact sits between the two
@@ -365,14 +375,14 @@ pub fn polygons(a: *const Polygon, xa: Transform, b: *const Polygon, xb: Transfo
 test "two circles touch along the line between their centres" {
     const a: Circle = .{ .radius = 1 };
     const b: Circle = .{ .radius = 0.5 };
-    const m = circles(a, .init(.zero, 0), b, .init(.init(1.2, 0), 0));
+    const m = circles(a, .init(.zero, 0), b, .init(.init(1.2, 0), 0), 0);
     try testing.expectEqual(@as(u32, 1), m.count);
     try testing.expect(m.normal.approxEql(.unit_x));
     try testing.expectApproxEqAbs(@as(f32, -0.3), m.points[0].separation, 1e-6);
     // Midway between x = 1 and x = 0.7.
     try testing.expectApproxEqAbs(@as(f32, 0.85), m.points[0].point.x, 1e-6);
 
-    try testing.expectEqual(@as(u32, 0), circles(a, .identity, b, .init(.init(2, 0), 0)).count);
+    try testing.expectEqual(@as(u32, 0), circles(a, .identity, b, .init(.init(2, 0), 0), 0).count);
 }
 
 test "a circle on a box's face, corner, and inside it" {
@@ -380,24 +390,24 @@ test "a circle on a box's face, corner, and inside it" {
     const ball: Circle = .{ .radius = 0.5 };
 
     // Sitting on the face at +y, slightly inside.
-    const on_face = polygonCircle(&box, .identity, ball, .init(.init(0.3, 1.4), 0));
+    const on_face = polygonCircle(&box, .identity, ball, .init(.init(0.3, 1.4), 0), 0);
     try testing.expectEqual(@as(u32, 1), on_face.count);
     try testing.expect(on_face.normal.approxEql(.unit_y));
     try testing.expectApproxEqAbs(@as(f32, -0.1), on_face.points[0].separation, 1e-6);
     try testing.expectApproxEqAbs(@as(f32, 0.3), on_face.points[0].point.x, 1e-6);
 
     // Off the corner, diagonally.
-    const at_corner = polygonCircle(&box, .identity, ball, .init(.init(1.3, 1.3), 0));
+    const at_corner = polygonCircle(&box, .identity, ball, .init(.init(1.3, 1.3), 0), 0);
     try testing.expectEqual(@as(u32, 1), at_corner.count);
     try testing.expectApproxEqAbs(@as(f32, 1.0 / @sqrt(2.0)), at_corner.normal.x, 1e-5);
     try testing.expect(at_corner.points[0].separation < 0);
     try testing.expect(at_corner.points[0].id != on_face.points[0].id);
 
     // Past the corner, not touching.
-    try testing.expectEqual(@as(u32, 0), polygonCircle(&box, .identity, ball, .init(.init(1.4, 1.4), 0)).count);
+    try testing.expectEqual(@as(u32, 0), polygonCircle(&box, .identity, ball, .init(.init(1.4, 1.4), 0), 0).count);
 
     // Deep inside: pushed out of the nearest face, which is +x here.
-    const inside = polygonCircle(&box, .identity, ball, .init(.init(0.8, 0.1), 0));
+    const inside = polygonCircle(&box, .identity, ball, .init(.init(0.8, 0.1), 0), 0);
     try testing.expectEqual(@as(u32, 1), inside.count);
     try testing.expect(inside.normal.approxEql(.unit_x));
     try testing.expectApproxEqAbs(@as(f32, -0.7), inside.points[0].separation, 1e-6);
@@ -407,7 +417,7 @@ test "a box resting on a wider box makes two points and a normal towards it" {
     const ground: Polygon = .box(5, 0.5);
     const crate: Polygon = .box(0.5, 0.5);
     // Ground top at y = -0.5; crate bottom at y = -0.45 is 0.05 inside.
-    const m = polygons(&ground, .identity, &crate, .init(.init(1, -0.95), 0));
+    const m = polygons(&ground, .identity, &crate, .init(.init(1, -0.95), 0), 0);
     try testing.expectEqual(@as(u32, 2), m.count);
     try testing.expect(m.normal.approxEql(.init(0, -1)));
     for (m.pointSlice()) |p| {
@@ -418,12 +428,37 @@ test "a box resting on a wider box makes two points and a normal towards it" {
     try testing.expect(@abs(m.points[0].point.x - m.points[1].point.x) > 0.9);
 
     // The same pair the other way round has the opposite normal.
-    const back = polygons(&crate, .init(.init(1, -0.95), 0), &ground, .identity);
+    const back = polygons(&crate, .init(.init(1, -0.95), 0), &ground, .identity, 0);
     try testing.expectEqual(@as(u32, 2), back.count);
     try testing.expect(back.normal.approxEql(.init(0, 1)));
 
     // Lifted clear, nothing.
-    try testing.expectEqual(@as(u32, 0), polygons(&ground, .identity, &crate, .init(.init(1, -1.2), 0)).count);
+    try testing.expectEqual(@as(u32, 0), polygons(&ground, .identity, &crate, .init(.init(1, -1.2), 0), 0).count);
+}
+
+test "a margin keeps points that are near, with how far apart they are" {
+    const ground: Polygon = .box(5, 0.5);
+    const crate: Polygon = .box(0.5, 0.5);
+    const ball: Circle = .{ .radius = 0.5 };
+    // Each a hundredth clear of the ground, whose top is at y = -0.5.
+    const crate_xf: Transform = .init(.init(1, -1.01), 0);
+    const ball_xf: Transform = .init(.init(1, -1.01), 0);
+
+    try testing.expectEqual(@as(u32, 0), polygons(&ground, .identity, &crate, crate_xf, 0).count);
+    const near = polygons(&ground, .identity, &crate, crate_xf, 0.02);
+    try testing.expectEqual(@as(u32, 2), near.count);
+    for (near.pointSlice()) |p| try testing.expectApproxEqAbs(@as(f32, 0.01), p.separation, 1e-5);
+    // And not past the margin.
+    try testing.expectEqual(@as(u32, 0), polygons(&ground, .identity, &crate, crate_xf, 0.005).count);
+
+    try testing.expectEqual(@as(u32, 0), polygonCircle(&ground, .identity, ball, ball_xf, 0).count);
+    const near_ball = polygonCircle(&ground, .identity, ball, ball_xf, 0.02);
+    try testing.expectEqual(@as(u32, 1), near_ball.count);
+    try testing.expectApproxEqAbs(@as(f32, 0.01), near_ball.points[0].separation, 1e-5);
+
+    const other: Transform = .init(.init(1.01, 0), 0);
+    try testing.expectEqual(@as(u32, 0), circles(ball, .identity, ball, other, 0).count);
+    try testing.expectApproxEqAbs(@as(f32, 0.01), circles(ball, .identity, ball, other, 0.02).points[0].separation, 1e-5);
 }
 
 test "a turned box on a face touches at one corner" {
@@ -431,7 +466,7 @@ test "a turned box on a face touches at one corner" {
     const crate: Polygon = .box(0.5, 0.5);
     const r = @sqrt(2.0) * 0.5;
     // Balanced on a corner, that corner 0.02 into the ground.
-    const m = polygons(&ground, .identity, &crate, .init(.init(0, -0.5 - r + 0.02), std.math.pi / 4.0));
+    const m = polygons(&ground, .identity, &crate, .init(.init(0, -0.5 - r + 0.02), std.math.pi / 4.0), 0);
     try testing.expectEqual(@as(u32, 1), m.count);
     try testing.expectApproxEqAbs(@as(f32, -0.02), m.points[0].separation, 1e-4);
     try testing.expect(m.normal.approxEql(.init(0, -1)));
@@ -442,7 +477,7 @@ test "ids follow the corners when the incident edge is clipped" {
     // corner, the other is made by the ground's side plane.
     const ground: Polygon = .box(1, 0.5);
     const crate: Polygon = .box(0.5, 0.5);
-    const m = polygons(&ground, .identity, &crate, .init(.init(1.2, -0.98), 0));
+    const m = polygons(&ground, .identity, &crate, .init(.init(1.2, -0.98), 0), 0);
     try testing.expectEqual(@as(u32, 2), m.count);
     const fa: Feature = @bitCast(m.points[0].id);
     const fb: Feature = @bitCast(m.points[1].id);

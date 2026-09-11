@@ -191,9 +191,9 @@ test "the same scene is the same to the bit with workers and without" {
 
         // A bowl of static boxes and a heap of mixed bodies in it. The
         // walls lean outwards, so the bowl opens upwards; and they are
-        // thick, because a thin wall is what a body squeezed by a pile
-        // goes through - there is no continuous collision here, and the
-        // README says so.
+        // thick, because a thin wall is what a body squeezed by a pile goes
+        // through - slowly, a little each step, which is not what the
+        // continuous sweep is for: it catches what is fast.
         const left = try world.createBody(.{ .type = .static, .position = .init(-4, 0), .angle = -0.5 });
         _ = try world.addShape(left, .box(0.5, 4));
         const right = try world.createBody(.{ .type = .static, .position = .init(4, 0), .angle = 0.5 });

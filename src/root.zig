@@ -7,7 +7,9 @@
 //!   `shape`       circles and convex polygons, materials and filters
 //!   `joint`       hinges, sliders, rods, ropes, springs, welds, wheels
 //!   `collide`     where two shapes touch, and how deep
-//!   `broadphase`  which pairs are close enough to ask
+//!   `broadphase`  which pairs of moving shapes are close enough to ask
+//!   `Tree`        the level's shapes, for finding what is near without looking at all
+//!   `continuous`  where a fast body first touched something, and whether it matters
 //!   `contact`     a contact as the solver sees it
 //!   `solver`      how a step is spread across the cores
 //!   `geometry`    rotations, transforms, and 2D boxes
@@ -53,6 +55,8 @@ pub const shape = @import("shape.zig");
 pub const joint = @import("joint.zig");
 pub const collide = @import("collide.zig");
 pub const broadphase = @import("broadphase.zig");
+pub const Tree = @import("tree.zig");
+pub const continuous = @import("continuous.zig");
 pub const contact = @import("contact.zig");
 pub const solver = @import("solver.zig");
 pub const geometry = @import("geometry.zig");
@@ -113,10 +117,14 @@ test {
     _ = Softness;
     _ = collide;
     _ = broadphase;
+    _ = Tree;
+    _ = continuous;
     _ = contact;
     _ = solver;
     _ = geometry;
     _ = @import("physics_test.zig");
     _ = @import("joint_test.zig");
     _ = @import("sleep_test.zig");
+    _ = @import("continuous_test.zig");
+    _ = @import("level_test.zig");
 }

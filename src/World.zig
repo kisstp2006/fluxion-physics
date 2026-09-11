@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: BSD-2-Clause
 
 //! The bodies, the shapes on them, and one step of time.
 //!
@@ -21,9 +21,9 @@
 //!
 //! | Phase | What | On |
 //! | --- | --- | --- |
-//! | wake | sleepers a joint drives, or somebody pushed | one, then every core |
+//! | wake | sleepers a joint drives, or somebody pushed; where each starts | one, then every core |
 //! | update boxes | each moving shape's box in the world | every core |
-//! | broad phase | which boxes overlap, of pairs with something moving | one |
+//! | broad phase | which boxes overlap, of pairs with something moving: the sweep, then the level's tree | one |
 //! | narrow phase | where each pair touches | every core |
 //! | prepare contacts | into constraints, warm-started; sleeping ones kept | one |
 //! | colour | contacts and joints into runs that share no body | one |
@@ -32,6 +32,7 @@
 //! | *each substep:* integrate positions | move, turn; then the joints measured again | every core |
 //! | *each substep:* relax | the pushing taken back out of the velocities | every core, per colour |
 //! | restitution | bounces | every core, per colour |
+//! | sweep | fast bodies along their paths, back to where they first touched | every core |
 //! | remember | impulses for next step, begin and end events | one |
 //! | sleep | who has been still, and which islands rest or wake | one |
 //!
@@ -63,8 +64,21 @@
 //! - wants a `Body.wake`. Islands are found again every step, which costs a
 //! pass over the contacts and never goes stale.
 //!
-//! **What is not here yet**: continuous collision, and a tree for queries.
-//! Each is listed in the README with what it would take.
+//! **The level is in a tree.** Every shape on a static body is a leaf of
+//! `static_tree`, and everything else is in the sweep. Each awake dynamic
+//! shape asks the tree what is near it, and the queries ask the tree for the
+//! level and walk only the shapes that move. So a level of thousands of
+//! tiles costs a step what is near the moving bodies - and the passes over
+//! bodies walk only `movers`, so it costs nothing for being thousands of
+//! bodies either.
+//!
+//! **Fast bodies are swept.** A step that only looks at where bodies are
+//! lets one pass through a wall thinner than its step. So after the
+//! substeps, every body that moved more than half its thinnest extent is
+//! swept along its path, against the level and - for a `Body.Def.bullet` -
+//! the other moving bodies, and put back where it first touched anything it
+//! should not have gone into. See `continuous` for how, and for why a touch
+//! that is only a graze, such as the next tile of a floor, is left alone.
 
 const std = @import("std");
 const testing = std.testing;
@@ -83,7 +97,9 @@ const Body = @import("body.zig");
 const collide = @import("collide.zig");
 const Manifold = collide.Manifold;
 const broadphase = @import("broadphase.zig");
+const Tree = @import("tree.zig");
 const contact = @import("contact.zig");
+const continuous = @import("continuous.zig");
 const joint_mod = @import("joint.zig");
 const Joint = joint_mod.Joint;
 const solver = @import("solver.zig");
@@ -142,6 +158,11 @@ pub const Settings = struct {
     sleep_threshold: f32 = 0.05,
     /// How long an island must be still before it sleeps. Seconds.
     time_to_sleep: f32 = 0.5,
+    /// Whether a body that moved more than half its thinnest extent in a
+    /// step is swept along its path for the level it went through - and a
+    /// `Body.Def.bullet` for the moving bodies too. Off, a fast ball passes
+    /// through a wall thinner than its step. See `continuous`.
+    enable_continuous: bool = true,
 };
 
 /// A shape as the world keeps it: the definition, and where it hangs.
@@ -152,6 +173,9 @@ pub const ShapeEntry = struct {
     body_index: u32,
     /// The next shape on the same body. See `Body.first_shape`.
     next: ShapeId,
+    /// Its leaf in `static_tree`, for a shape on a static body; `null_node`
+    /// for one that moves, which is in the sweep instead.
+    proxy: u32 = Tree.null_node,
 };
 
 /// Two shapes that started or stopped touching during the last step.
@@ -199,12 +223,27 @@ gravity: Vec2,
 bodies: id.Table(Body) = .empty,
 shapes: id.Table(ShapeEntry) = .empty,
 joints: id.Table(Joint) = .empty,
+/// The shapes that move - on dynamic and kinematic bodies - sorted along x.
 sweep: broadphase.Sweep(*World) = .empty,
+/// The shapes that do not: the level. Each moving shape asks it what is
+/// near, and the queries ask it first. See `Tree`.
+static_tree: Tree = .empty,
 
 /// Pairs of bodies a joint says must not collide, by slot, with how many
 /// joints say so. Asked by the broad phase for every pair it finds while
 /// there is anything in it; see `bodyPairKey`.
 no_collide: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+
+/// The slots of every body that is not static, in slot order: what the
+/// passes over bodies walk. A level built of a body per tile is thousands
+/// of bodies that never move, and a step that visited each of them a dozen
+/// times - forces, movement, sleep - spent more time on the level than on
+/// the game. Rebuilt when a body comes or goes, which `movers_dirty` says.
+movers: std.ArrayList(u32) = .empty,
+movers_dirty: bool = false,
+/// Static bodies moved by `setTransform` since the last step, whose flag
+/// is cleared once the step has looked at it.
+moved_level: std.ArrayList(u32) = .empty,
 
 // Per-step scratch, kept so a step allocates only when the scene grows.
 aabbs: std.ArrayList(Aabb) = .empty,
@@ -273,6 +312,9 @@ pub fn deinit(self: *World) void {
     self.shapes.deinit(gpa);
     self.joints.deinit(gpa);
     self.sweep.deinit(gpa);
+    self.static_tree.deinit(gpa);
+    self.movers.deinit(gpa);
+    self.moved_level.deinit(gpa);
     self.no_collide.deinit(gpa);
     self.aabbs.deinit(gpa);
     self.pairs.deinit(gpa);
@@ -296,7 +338,19 @@ pub fn deinit(self: *World) void {
 // -------------------------------------------------------------------------
 
 pub fn createBody(self: *World, def: Body.Def) Error!BodyId {
+    if (def.type != .static) self.movers_dirty = true;
     return self.bodies.add(self.gpa, .fromDef(def));
+}
+
+/// The slots of the bodies that move, fresh. See `movers`.
+fn refreshMovers(self: *World) Error!void {
+    if (!self.movers_dirty) return;
+    self.movers.clearRetainingCapacity();
+    for (self.bodies.slots.items, 0..) |*slot, i| {
+        const b = &(slot.value orelse continue);
+        if (b.type != .static) try self.movers.append(self.gpa, @intCast(i));
+    }
+    self.movers_dirty = false;
 }
 
 /// Take a body, every shape on it and every joint to it out of the world.
@@ -304,6 +358,7 @@ pub fn createBody(self: *World, def: Body.Def) Error!BodyId {
 /// from now on.
 pub fn destroyBody(self: *World, handle: BodyId) void {
     const doomed = self.bodies.get(handle) orelse return;
+    if (doomed.type != .static) self.movers_dirty = true;
 
     // A linear walk, because a body does not keep a list of its joints:
     // destroying is rare beside stepping, and a list would be two more
@@ -318,7 +373,7 @@ pub fn destroyBody(self: *World, handle: BodyId) void {
     var next = doomed.first_shape;
     while (self.shapes.get(next)) |entry| {
         const after = entry.next;
-        self.sweep.remove(next.index);
+        self.unenrol(next.index, entry);
         _ = self.shapes.remove(next);
         next = after;
     }
@@ -364,11 +419,26 @@ pub fn addShape(self: *World, body_handle: BodyId, def: Shape) ShapeError!ShapeI
         .next = owner.first_shape,
     });
     errdefer _ = self.shapes.remove(handle);
-    try self.sweep.add(self.gpa, handle.index);
+    try self.enrol(handle.index, self.shapes.get(handle).?, owner);
     owner.first_shape = handle;
     owner.shape_count += 1;
     self.updateMass(body_handle);
     return handle;
+}
+
+/// Put a shape where the broad phase will find it: a static body's in the
+/// level's tree, anything that moves in the sweep.
+fn enrol(self: *World, index: u32, entry: *ShapeEntry, owner: *const Body) Allocator.Error!void {
+    if (owner.type == .static) {
+        entry.proxy = try self.static_tree.insert(self.gpa, entry.def.geometry.aabb(owner.transform), index);
+    } else {
+        try self.sweep.add(self.gpa, index);
+    }
+}
+
+/// And take it out again.
+fn unenrol(self: *World, index: u32, entry: *const ShapeEntry) void {
+    if (entry.proxy != Tree.null_node) self.static_tree.remove(entry.proxy) else self.sweep.remove(index);
 }
 
 /// Take one shape off its body. The body stays, lighter.
@@ -390,7 +460,7 @@ pub fn removeShape(self: *World, handle: ShapeId) void {
         }
         owner.shape_count -= 1;
     }
-    self.sweep.remove(handle.index);
+    self.unenrol(handle.index, entry);
     _ = self.shapes.remove(handle);
     self.updateMass(owner_handle);
 }
@@ -433,7 +503,9 @@ pub fn updateMass(self: *World, handle: BodyId) void {
 
     if (b.type != .dynamic) {
         b.center = b.transform.p;
-        b.extent = self.extentOf(b);
+        const extents = self.extentsOf(b);
+        b.extent = extents.reach;
+        b.min_extent = extents.thinnest;
         return;
     }
 
@@ -472,23 +544,24 @@ pub fn updateMass(self: *World, handle: BodyId) void {
     b.local_center = local_center;
     b.center = b.transform.apply(local_center);
     b.linear_velocity = b.linear_velocity.add(geometry.crossSV(b.angular_velocity, b.center.sub(old_center)));
-    b.extent = self.extentOf(b);
+    const extents = self.extentsOf(b);
+    b.extent = extents.reach;
+    b.min_extent = extents.thinnest;
     b.wake();
 }
 
-/// How far a body's shapes reach from its centre of mass.
-fn extentOf(self: *World, b: *const Body) f32 {
+/// How far a body's shapes reach from its centre of mass, and how thin the
+/// thinnest of them is. See `Body.extent` and `Body.min_extent`.
+fn extentsOf(self: *World, b: *const Body) struct { reach: f32, thinnest: f32 } {
     var reach: f32 = 0;
+    var thinnest: ?f32 = null;
     var cursor = b.first_shape;
     while (self.shapes.get(cursor)) |entry| : (cursor = entry.next) {
-        switch (entry.def.geometry) {
-            .circle => |c| reach = @max(reach, c.center.dist(b.local_center) + c.radius),
-            .polygon => |*p| {
-                for (p.vertexSlice()) |v| reach = @max(reach, v.dist(b.local_center));
-            },
-        }
+        reach = @max(reach, entry.def.geometry.reach(b.local_center));
+        const thin = entry.def.geometry.minExtent();
+        thinnest = if (thinnest) |t| @min(t, thin) else thin;
     }
-    return reach;
+    return .{ .reach = reach, .thinnest = thinnest orelse 0 };
 }
 
 /// How many dynamic bodies are awake. For the log line that says whether
@@ -622,6 +695,14 @@ const Step = struct {
     /// in radians per substep. See `integrateVelocities`.
     max_speed: f32,
     max_turn: f32,
+    /// How far ahead a body stopped short looks for what it touches.
+    speculative: f32,
+    /// The continuous pass: how close a first touch is, give or take, and
+    /// how deep the rest of a path may sink in and still be a graze. See
+    /// `continuous`. All in world units.
+    toi_target: f32,
+    toi_tolerance: f32,
+    graze: f32,
 };
 
 /// Advance the world by `dt` seconds, on `jobs`.
@@ -659,11 +740,12 @@ pub fn step(self: *World, dt: f32, jobs: *Jobs) Error!void {
     const fastest = 0.25 * inv_h;
     const contact_hertz = @min(self.settings.contact_hertz, fastest);
     const joint_hertz = @min(self.settings.joint_hertz, fastest);
+    const slop = self.settings.linear_slop * units;
     const joint_step: joint_mod.Step = .{
         .dt = h,
         .inv_dt = inv_h,
         .stiffness = if (joint_hertz > 0) .of(joint_hertz, self.settings.joint_damping_ratio, h) else .rigid,
-        .slop = self.settings.linear_slop * units,
+        .slop = slop,
         .units_per_metre = units,
     };
     var joint_relax = joint_step;
@@ -675,7 +757,7 @@ pub fn step(self: *World, dt: f32, jobs: *Jobs) Error!void {
         .inv_h = inv_h,
         .contact = .{
             .inv_h = inv_h,
-            .slop = self.settings.linear_slop * units,
+            .slop = slop,
             .max_push = self.settings.max_push_speed * units,
         },
         .contact_softness = .of(contact_hertz, self.settings.contact_damping_ratio, h),
@@ -684,31 +766,45 @@ pub fn step(self: *World, dt: f32, jobs: *Jobs) Error!void {
         .joint_relax = joint_relax,
         .max_speed = self.settings.max_speed * units,
         .max_turn = 0.25 * std.math.pi,
+        // Box2D v3's numbers: a first touch a slop short, found to within a
+        // quarter of one, and a look four slops ahead.
+        .speculative = 4 * slop,
+        .toi_target = slop,
+        .toi_tolerance = 0.25 * slop,
+        .graze = 4 * slop,
     };
     self.inv_h = inv_h;
 
     const body_slots = self.bodies.slotCount();
-    const shape_slots = self.shapes.slotCount();
-    try self.aabbs.resize(gpa, shape_slots);
+    try self.aabbs.resize(gpa, self.shapes.slotCount());
+    try self.refreshMovers();
+    const movers = self.movers.items.len;
 
     // 0. Sleepers a joint is asking to move, or somebody has pushed, woken
-    //    before anything looks.
+    //    before anything looks, and where everything starts from noted.
     self.wakeDrivenJoints();
-    solver.forRange(jobs, body_slots, grain_bodies, &ctx, wakePushed);
+    solver.forRange(jobs, movers, grain_bodies, &ctx, beginStep);
 
-    // 1. Where every moving shape is.
-    solver.forRange(jobs, shape_slots, grain_bodies, &ctx, updateAabbs);
+    // 1. Where every moving shape is, and where a level moved by hand now
+    //    is in its tree.
+    solver.forRange(jobs, self.sweep.order.items.len, grain_bodies, &ctx, updateAabbs);
+    try self.refitMovedLevel();
 
-    // 2. Which boxes overlap.
+    // 2. Which boxes overlap: moving shapes against each other, by the
+    //    sweep, and against the level, by asking its tree.
     self.pairs.clearRetainingCapacity();
     try self.sweep.update(gpa, self.aabbs.items, self, acceptPair, &self.pairs);
+    try self.findLevelPairs();
 
     // 3. Where each pair touches.
     try self.manifolds.resize(gpa, self.pairs.items.len);
     solver.forRange(jobs, self.pairs.items.len, grain_pairs, &ctx, narrowPhase);
 
-    // 4. Contacts into constraints, remembering what is touching.
+    // 4. Contacts into constraints, remembering what is touching. A level
+    //    moved by hand has been looked at by now, sleeping contacts and all.
     try self.prepareContacts(ctx);
+    for (self.moved_level.items) |index| self.bodyAt(index).teleported = false;
+    self.moved_level.clearRetainingCapacity();
 
     // 5. The joints that can move something.
     try self.gatherJoints();
@@ -724,22 +820,28 @@ pub fn step(self: *World, dt: f32, jobs: *Jobs) Error!void {
     //    see where the bodies are.
     solver.forRange(jobs, self.joint_refs.items.len, grain_joints, &ctx, prepareJoints);
     for (0..substeps) |_| {
-        solver.forRange(jobs, body_slots, grain_bodies, &ctx, integrateVelocities);
+        solver.forRange(jobs, movers, grain_bodies, &ctx, integrateVelocities);
         self.warmStartAll(jobs, &ctx);
         self.solveAll(jobs, &ctx, .solve);
-        solver.forRange(jobs, body_slots, grain_bodies, &ctx, integratePositions);
+        solver.forRange(jobs, movers, grain_bodies, &ctx, integratePositions);
         solver.forRange(jobs, self.joint_refs.items.len, grain_joints, &ctx, prepareJoints);
         self.solveAll(jobs, &ctx, .relax);
     }
 
     // 8. Bounce, and forget the forces, which pushed for the whole step.
     self.restituteAll(jobs, &ctx);
-    solver.forRange(jobs, body_slots, grain_bodies, &ctx, clearForces);
+    solver.forRange(jobs, movers, grain_bodies, &ctx, clearForces);
 
-    // 9. What to remember, and what changed.
+    // 9. Every body that moved fast swept along its path, and put back
+    //    where it first touched anything it went into: the rest first, then
+    //    the bullets, which sweep against the rest where they now are.
+    solver.forRange(jobs, movers, grain_bodies, &ctx, sweepRun(false));
+    solver.forRange(jobs, movers, grain_bodies, &ctx, sweepRun(true));
+
+    // 10. What to remember, and what changed.
     try self.rememberContacts();
 
-    // 10. Which islands rest, and which wake.
+    // 11. Which islands rest, and which wake.
     try self.updateSleep(dt);
     self.step_count += 1;
 }
@@ -772,13 +874,16 @@ fn wakeDrivenJoints(self: *World) void {
 
 /// A sleeper that somebody has pushed since it fell asleep - or that may
 /// not sleep any more - wakes. Alone: its island follows at the end of the
-/// step.
-fn wakePushed(ctx: *const Step, begin: usize, end: usize) void {
+/// step. And every dynamic body notes where it starts from, which is where
+/// the continuous pass sweeps it from.
+fn beginStep(ctx: *const Step, begin: usize, end: usize) void {
     const world = ctx.world;
-    for (world.bodies.slots.items[begin..end]) |*slot| {
-        const b = &(slot.value orelse continue);
-        if (b.type != .dynamic or b.awake) continue;
-        if (b.isPushed() or !b.allow_sleep or !world.settings.enable_sleep) b.wake();
+    for (world.movers.items[begin..end]) |index| {
+        const b = world.bodyAt(index);
+        if (b.type != .dynamic) continue;
+        if (!b.awake and (b.isPushed() or !b.allow_sleep or !world.settings.enable_sleep)) b.wake();
+        b.center0 = b.center;
+        b.angle0 = b.angle;
     }
 }
 
@@ -786,8 +891,8 @@ fn wakePushed(ctx: *const Step, begin: usize, end: usize) void {
 fn integrateVelocities(ctx: *const Step, begin: usize, end: usize) void {
     const world = ctx.world;
     const h = ctx.h;
-    for (world.bodies.slots.items[begin..end]) |*slot| {
-        const b = &(slot.value orelse continue);
+    for (world.movers.items[begin..end]) |index| {
+        const b = world.bodyAt(index);
         if (b.type != .dynamic or !b.awake) continue;
 
         const acceleration = world.gravity.scale(b.gravity_scale).mulAdd(b.force, b.inv_mass);
@@ -815,25 +920,87 @@ fn integrateVelocities(ctx: *const Step, begin: usize, end: usize) void {
 
 /// Forces push for a whole step, every substep of it, and are then gone.
 fn clearForces(ctx: *const Step, begin: usize, end: usize) void {
-    for (ctx.world.bodies.slots.items[begin..end]) |*slot| {
-        const b = &(slot.value orelse continue);
+    for (ctx.world.movers.items[begin..end]) |index| {
+        const b = ctx.world.bodyAt(index);
         b.force = .zero;
         b.torque = 0;
     }
 }
 
+/// The box of every moving shape - the sweep's, which are only ever those.
 fn updateAabbs(ctx: *const Step, begin: usize, end: usize) void {
     const world = ctx.world;
-    for (world.shapes.slots.items[begin..end], begin..) |*slot, i| {
-        const entry = &(slot.value orelse continue);
+    for (world.sweep.order.items[begin..end]) |index| {
+        const entry = &world.shapes.slots.items[index].value.?;
         const b = world.bodyAt(entry.body_index);
-        // Asleep, it has not moved, and its box is still the one it had.
-        // Everything that can wake a body without a step - a new shape,
-        // `setTransform` - wakes it first, so no box here is ever stale.
+        // Asleep, a body has not moved, and its box is still the one it
+        // had: everything that can wake a body without a step - a new
+        // shape, `setTransform` - wakes it first, so no box here is stale.
         if (!b.awake) continue;
-        world.aabbs.items[i] = entry.def.geometry.aabb(b.transform);
+        const box = entry.def.geometry.aabb(b.transform);
+        // Stopped short, it looks a little ahead; see `narrowPhase`.
+        world.aabbs.items[index] = if (b.stopped_short) box.grow(ctx.speculative) else box;
     }
 }
+
+/// A static body moved by `setTransform` since the last step: its leaves in
+/// the level's tree move with it, and it is noted in `moved_level`, whose
+/// flags are cleared once the contacts have seen them. On one thread,
+/// because a tree is one structure.
+///
+/// The one walk a step still makes over every body, because `setTransform`
+/// is the body's own and cannot tell the world. It reads a few bytes of
+/// each: over seven thousand tiles, a few hundredths of a millisecond.
+fn refitMovedLevel(self: *World) Error!void {
+    for (self.bodies.slots.items, 0..) |*slot, i| {
+        const b = &(slot.value orelse continue);
+        if (b.type != .static or !b.teleported) continue;
+        try self.moved_level.append(self.gpa, @intCast(i));
+        var cursor = b.first_shape;
+        while (self.shapes.get(cursor)) |entry| : (cursor = entry.next) {
+            try self.static_tree.move(self.gpa, entry.proxy, entry.def.geometry.aabb(b.transform));
+        }
+    }
+}
+
+/// Every pair of a moving shape and a piece of the level whose boxes
+/// overlap, into `pairs`, after the sweep's. Each dynamic shape that is
+/// awake asks the tree about its own box: a sleeper keeps what it had, and
+/// a kinematic body has nothing to say to a wall.
+///
+/// In the sweep's order and then the tree's, both of which depend only on
+/// what was added and where, so the pairs - and the step - come out the
+/// same on every run.
+fn findLevelPairs(self: *World) Error!void {
+    if (self.static_tree.root == Tree.null_node) return;
+    var visitor: LevelVisitor = .{ .world = self };
+    for (self.sweep.order.items) |index| {
+        const entry = &self.shapes.slots.items[index].value.?;
+        const b = self.bodyAt(entry.body_index);
+        if (b.type != .dynamic or !b.awake) continue;
+        visitor.shape = index;
+        self.static_tree.query(self.aabbs.items[index], &visitor, LevelVisitor.visit);
+        if (visitor.failed) return error.OutOfMemory;
+    }
+}
+
+const LevelVisitor = struct {
+    world: *World,
+    shape: u32 = 0,
+    failed: bool = false,
+
+    fn visit(self: *LevelVisitor, level_shape: u32) bool {
+        if (!acceptPair(self.world, self.shape, level_shape)) return true;
+        self.world.pairs.append(self.world.gpa, .{
+            .a = @min(self.shape, level_shape),
+            .b = @max(self.shape, level_shape),
+        }) catch {
+            self.failed = true;
+            return false;
+        };
+        return true;
+    }
+};
 
 /// Whether a pair of overlapping boxes is worth the narrow phase this step.
 fn acceptPair(world: *World, a: u32, b: u32) bool {
@@ -863,27 +1030,29 @@ fn narrowPhase(ctx: *const Step, begin: usize, end: usize) void {
     for (world.pairs.items[begin..end], world.manifolds.items[begin..end]) |pair, *out| {
         const ea = &world.shapes.slots.items[pair.a].value.?;
         const eb = &world.shapes.slots.items[pair.b].value.?;
-        const xa = world.bodyAt(ea.body_index).transform;
-        const xb = world.bodyAt(eb.body_index).transform;
-        out.* = manifoldOf(&ea.def.geometry, xa, &eb.def.geometry, xb);
+        const ba = world.bodyAt(ea.body_index);
+        const bb = world.bodyAt(eb.body_index);
+        // A body stopped short last step looks ahead; see `Body.stopped_short`.
+        const margin = if (ba.stopped_short or bb.stopped_short) ctx.speculative else 0;
+        out.* = manifoldOf(&ea.def.geometry, ba.transform, &eb.def.geometry, bb.transform, margin);
     }
 }
 
 /// The right pairing for two geometries, with the normal always from A to
-/// B whichever way round the pairing was written.
-pub fn manifoldOf(a: *const shape_mod.Geometry, xa: Transform, b: *const shape_mod.Geometry, xb: Transform) Manifold {
+/// B whichever way round the pairing was written. `margin`: see `collide`.
+pub fn manifoldOf(a: *const shape_mod.Geometry, xa: Transform, b: *const shape_mod.Geometry, xb: Transform, margin: f32) Manifold {
     return switch (a.*) {
         .circle => |ca| switch (b.*) {
-            .circle => |cb| collide.circles(ca, xa, cb, xb),
+            .circle => |cb| collide.circles(ca, xa, cb, xb, margin),
             .polygon => |*pb| blk: {
-                var m = collide.polygonCircle(pb, xb, ca, xa);
+                var m = collide.polygonCircle(pb, xb, ca, xa, margin);
                 m.normal = m.normal.neg();
                 break :blk m;
             },
         },
         .polygon => |*pa| switch (b.*) {
-            .circle => |cb| collide.polygonCircle(pa, xa, cb, xb),
-            .polygon => |*pb| collide.polygons(pa, xa, pb, xb),
+            .circle => |cb| collide.polygonCircle(pa, xa, cb, xb, margin),
+            .polygon => |*pb| collide.polygons(pa, xa, pb, xb, margin),
         },
     };
 }
@@ -957,13 +1126,12 @@ fn prepareContacts(self: *World, ctx: Step) Error!void {
     }
 }
 
-/// Whether any dynamic body is asleep. A walk over the bodies rather than a
-/// count kept up to date, because `Body.sleep` and `Body.wake` are the
-/// body's own and cannot tell the world.
+/// Whether any dynamic body is asleep. A walk over the bodies that move
+/// rather than a count kept up to date, because `Body.sleep` and
+/// `Body.wake` are the body's own and cannot tell the world.
 fn anyAsleep(self: *World) bool {
-    for (self.bodies.slots.items) |*slot| {
-        const b = &(slot.value orelse continue);
-        if (!b.awake) return true;
+    for (self.movers.items) |index| {
+        if (!self.bodyAt(index).awake) return true;
     }
     return false;
 }
@@ -1130,16 +1298,170 @@ fn solveJointsHere(self: *World, refs: []const joint_mod.Ref, joint_step: joint_
 /// One substep's worth of movement.
 fn integratePositions(ctx: *const Step, begin: usize, end: usize) void {
     const h = ctx.h;
-    for (ctx.world.bodies.slots.items[begin..end]) |*slot| {
-        const b = &(slot.value orelse continue);
+    for (ctx.world.movers.items[begin..end]) |index| {
+        const b = ctx.world.bodyAt(index);
         // Whatever `setTransform` changed has been looked at by now.
         b.teleported = false;
-        if (b.type == .static or !b.awake) continue;
+        if (!b.awake) continue;
         b.center = b.center.mulAdd(b.linear_velocity, h);
         b.angle += h * b.angular_velocity;
         b.syncTransform();
     }
 }
+
+/// The job that sweeps the fast bodies of one kind: bullets or the rest.
+/// A function made per kind, as `solveRun` is.
+fn sweepRun(comptime bullets: bool) fn (*const Step, usize, usize) void {
+    return struct {
+        fn go(ctx: *const Step, begin: usize, end: usize) void {
+            const world = ctx.world;
+            for (world.movers.items[begin..end]) |index| {
+                const b = world.bodyAt(index);
+                if (b.type != .dynamic or b.bullet != bullets) continue;
+                b.stopped_short = false;
+                if (!b.awake or !world.settings.enable_continuous) continue;
+                world.sweepBody(index, b, ctx);
+            }
+        }
+    }.go;
+}
+
+/// Sweep one body along the path it took this step, and if it went into
+/// something in a way the step could not have seen, put it back where it
+/// first touched. See `continuous`.
+///
+/// Each body reads only the level, or for a bullet the bodies that are not
+/// bullets - all of them where they have finished moving - and writes only
+/// itself, so every body can be swept at once.
+fn sweepBody(self: *World, index: u32, b: *Body, ctx: *const Step) void {
+    // Moved less than half its thinnest, it cannot have gone through
+    // anything unseen: the worst it can be is sunk in, and pushed out.
+    const moved = b.center.dist(b.center0) + @abs(b.angle - b.angle0) * b.extent;
+    if (moved <= 0.5 * b.min_extent) return;
+
+    var sweeper: Sweeper = .{
+        .world = self,
+        .ctx = ctx,
+        .body = b,
+        .path = .{ .local_center = b.local_center, .c0 = b.center0, .a0 = b.angle0, .c1 = b.center, .a1 = b.angle },
+    };
+    var cursor = b.first_shape;
+    while (self.shapes.get(cursor)) |entry| : (cursor = entry.next) {
+        if (entry.def.sensor) continue;
+        sweeper.entry = entry;
+        // Every pose along the way fits in this: the centre's path, widened
+        // by as far as the shape reaches from the centre.
+        const reach = entry.def.geometry.reach(b.local_center);
+        const box: Aabb = .{
+            .min = b.center0.min(b.center).sub(.splat(reach)),
+            .max = b.center0.max(b.center).add(.splat(reach)),
+        };
+        self.static_tree.query(box, &sweeper, Sweeper.visitLevel);
+        if (!b.bullet) continue;
+        for (self.movers.items) |other_index| {
+            if (other_index == index) continue;
+            const other = self.bodyAt(other_index);
+            if (other.type == .dynamic and other.bullet) continue;
+            if (!boxNears(other, box)) continue;
+            var other_cursor = other.first_shape;
+            while (self.shapes.get(other_cursor)) |other_entry| : (other_cursor = other_entry.next) {
+                sweeper.consider(other_entry);
+            }
+        }
+    }
+
+    if (sweeper.fraction < 1) {
+        const t = sweeper.fraction;
+        b.center = b.center0.lerp(b.center, t);
+        b.angle = b.angle0 + t * (b.angle - b.angle0);
+        b.syncTransform();
+        b.stopped_short = true;
+        // Stopped at its first touch, it keeps its velocity, so the next
+        // step bounces it as it would anything it hit. Stopped after it was
+        // already pressed in - by a pile behind it, or by its own spin
+        // turning a corner in where the step's contacts were not looking -
+        // the speed that way is taken off: going on, it would go through.
+        if (sweeper.into) |into| {
+            const in_speed = b.linear_velocity.dot(into);
+            if (in_speed > 0) b.linear_velocity = b.linear_velocity.sub(into.scale(in_speed));
+        }
+    }
+}
+
+/// One shape of a fast body, asked about everything near its path.
+const Sweeper = struct {
+    world: *World,
+    ctx: *const Step,
+    body: *const Body,
+    path: continuous.Sweep,
+    entry: *const ShapeEntry = undefined,
+    /// How far along the earliest first touch that counts is, so far.
+    fraction: f32 = 1,
+    /// When that touch is one the shape was already pressed into, the way
+    /// into what it touched. See `sweepBody`.
+    into: ?Vec2 = null,
+
+    fn visitLevel(self: *Sweeper, level_shape: u32) bool {
+        self.consider(&self.world.shapes.slots.items[level_shape].value.?);
+        return true;
+    }
+
+    fn consider(self: *Sweeper, other: *const ShapeEntry) void {
+        if (other.def.sensor) return;
+        const world = self.world;
+        const ctx = self.ctx;
+        const other_body = world.bodyAt(other.body_index);
+        if (!world.mayTouch(self.entry, other, self.body, other_body)) return;
+        const g = &self.entry.def.geometry;
+        const og = &other.def.geometry;
+        const xo = other_body.transform;
+        switch (continuous.timeOfImpact(g, self.path, og, xo, self.fraction, ctx.toi_target, ctx.toi_tolerance)) {
+            .miss => {},
+            // Touching it already: only the core is swept, which is not, and
+            // which nothing the shape is sliding along can reach. A shape
+            // pressed in so deep that its core touches too - a thin rod
+            // shoved into a wall by a pile behind it - is left its centre,
+            // which at least may not cross into what it is pressed against.
+            .touching => {
+                const core = continuous.core(g);
+                switch (continuous.timeOfImpact(&core, self.path, og, xo, self.fraction, ctx.toi_target, ctx.toi_tolerance)) {
+                    .hit => |t| self.pressedIn(&core, og, xo, t),
+                    .miss => {},
+                    .touching => {
+                        const centre: shape_mod.Geometry = .{ .circle = .{ .center = g.centroid(), .radius = 0 } };
+                        switch (continuous.timeOfImpact(&centre, self.path, og, xo, self.fraction, 0, ctx.toi_tolerance)) {
+                            .hit => |t| self.pressedIn(&centre, og, xo, t),
+                            .miss, .touching => {},
+                        }
+                    },
+                }
+            },
+            .hit => |t| if (self.counts(g, og, xo, t)) {
+                self.fraction = t;
+                self.into = null;
+            },
+        }
+    }
+
+    /// The earliest touch is a shape that was already pressed into what it
+    /// touched, found by sweeping `inner` - its core or its centre. Which
+    /// way is in is kept, for the speed that way to be taken off.
+    fn pressedIn(self: *Sweeper, inner: *const shape_mod.Geometry, og: *const shape_mod.Geometry, xo: Transform, t: f32) void {
+        self.fraction = t;
+        self.into = continuous.separation(inner, self.path.at(t), og, xo).normal;
+    }
+
+    /// Whether a first touch at `t` is one the step would have got wrong:
+    /// the shape's core reaches what it touched, or the rest of the path
+    /// sinks it in deeper than a graze. Brushing onto the next tile of a
+    /// floor does neither, and is left to the next step.
+    fn counts(self: *const Sweeper, g: *const shape_mod.Geometry, og: *const shape_mod.Geometry, xo: Transform, t: f32) bool {
+        const ctx = self.ctx;
+        const core = continuous.core(g);
+        if (continuous.timeOfImpact(&core, self.path, og, xo, 1, ctx.toi_target, ctx.toi_tolerance) != .miss) return true;
+        return continuous.sinksPast(g, self.path, og, xo, t, ctx.graze);
+    }
+};
 
 /// Impulses into the contact map for next step's warm start, and the
 /// difference between this step's touching set and the last one's into
@@ -1195,9 +1517,9 @@ fn updateSleep(self: *World, dt: f32) Error!void {
     // plus the speed its spin gives its furthest edge. The push is not
     // counted - a body being eased out of another is not moving.
     const threshold = self.settings.sleep_threshold * self.settings.units_per_metre;
-    for (self.bodies.slots.items) |*slot| {
-        const b = &(slot.value orelse continue);
-        if (b.type == .static or !b.awake) continue;
+    for (self.movers.items) |index| {
+        const b = self.bodyAt(index);
+        if (!b.awake) continue;
         const speed = b.linear_velocity.len() + b.extent * @abs(b.angular_velocity);
         if (!b.allow_sleep or speed > threshold) b.sleep_time = 0 else b.sleep_time += dt;
     }
@@ -1221,10 +1543,10 @@ fn updateSleep(self: *World, dt: f32) Error!void {
     }
 
     // An island is as rested as its least rested member...
-    for (self.bodies.slots.items, 0..) |*slot, i| {
-        const b = &(slot.value orelse continue);
+    for (self.movers.items) |index| {
+        const b = self.bodyAt(index);
         if (b.type != .dynamic) continue;
-        const root = find(parent, @intCast(i));
+        const root = find(parent, index);
         rest[root] = @min(rest[root], b.sleep_time);
     }
 
@@ -1244,10 +1566,10 @@ fn updateSleep(self: *World, dt: f32) Error!void {
         }
     }
 
-    for (self.bodies.slots.items, 0..) |*slot, i| {
-        const b = &(slot.value orelse continue);
+    for (self.movers.items) |index| {
+        const b = self.bodyAt(index);
         if (b.type != .dynamic) continue;
-        if (rest[find(parent, @intCast(i))] >= self.settings.time_to_sleep) {
+        if (rest[find(parent, index)] >= self.settings.time_to_sleep) {
             if (b.awake) b.sleep();
         } else if (!b.awake) {
             b.wake();
@@ -1330,27 +1652,77 @@ pub fn colourCount(self: *const World) usize {
 /// The first thing a ray hits, from `origin` along `translation`, among
 /// shapes whose filter agrees with `filter`. Null if nothing.
 ///
-/// Every shape is asked, so this is linear in the scene; see `broadphase`
-/// for why, and for what would change it.
+/// The shapes that move are asked one by one - there are few beside a
+/// level - and the ray is shortened to the nearest of them; then the
+/// level's tree is walked with what is left, and only the branches that
+/// ray crosses are looked at. Logarithmic in the level.
 pub fn castRay(self: *World, origin: Vec2, translation: Vec2, filter: Filter) ?RayHit {
-    var best: ?RayHit = null;
-    var max_fraction: f32 = 1;
-    var it = self.shapes.iterator();
-    while (it.next()) |entry| {
-        if (!filter.shouldCollide(entry.value.def.filter)) continue;
-        const b = self.bodyAt(entry.value.body_index);
-        const xf = b.transform;
-        const hit = rayAgainst(&entry.value.def.geometry, xf, origin, translation, max_fraction) orelse continue;
-        max_fraction = hit.fraction;
-        best = .{
-            .shape = entry.handle,
-            .body = entry.value.body,
-            .point = origin.mulAdd(translation, hit.fraction),
+    var cast: RayCast = .{ .world = self, .origin = origin, .translation = translation, .filter = filter };
+    for (self.sweep.order.items) |index| {
+        const b = self.bodyAt(self.shapes.slots.items[index].value.?.body_index);
+        if (!rayNears(b, origin, translation, cast.fraction)) continue;
+        _ = cast.consider(index, cast.fraction);
+    }
+    self.static_tree.rayCast(origin, translation, cast.fraction, &cast, RayCast.consider);
+    return cast.best;
+}
+
+// Whether a query can reach anything on a body at all: the circle about
+// its centre of mass that its shapes all fit in, asked before the shapes
+// are. A few multiplies that turn most of the moving shapes away unasked -
+// which is what a query spends its time on once the level is in a tree.
+
+fn rayNears(b: *const Body, origin: Vec2, translation: Vec2, max_fraction: f32) bool {
+    const m = origin.sub(b.center);
+    const dd = translation.lenSq();
+    // The point of the ray nearest the centre, kept on the ray.
+    const t = if (dd > 0) std.math.clamp(-m.dot(translation) / dd, 0, max_fraction) else 0;
+    return m.mulAdd(translation, t).lenSq() <= b.extent * b.extent;
+}
+
+fn pointNears(b: *const Body, point: Vec2) bool {
+    return point.distSq(b.center) <= b.extent * b.extent;
+}
+
+fn boxNears(b: *const Body, box: Aabb) bool {
+    // The point of the box nearest the centre.
+    const nearest = b.center.max(box.min).min(box.max);
+    return nearest.distSq(b.center) <= b.extent * b.extent;
+}
+
+const RayCast = struct {
+    world: *World,
+    origin: Vec2,
+    translation: Vec2,
+    filter: Filter,
+    /// How far along the nearest hit so far is: where the ray now stops.
+    fraction: f32 = 1,
+    best: ?RayHit = null,
+
+    /// Ask one shape. Answers where the ray hits it if that is nearer than
+    /// `max_fraction`, or a negative number - which is what the tree wants
+    /// to hear from a visitor.
+    fn consider(self: *RayCast, index: u32, max_fraction: f32) f32 {
+        const world = self.world;
+        const entry = &world.shapes.slots.items[index].value.?;
+        if (!self.filter.shouldCollide(entry.def.filter)) return -1;
+        const xf = world.bodyAt(entry.body_index).transform;
+        const hit = rayAgainst(&entry.def.geometry, xf, self.origin, self.translation, max_fraction) orelse return -1;
+        self.fraction = hit.fraction;
+        self.best = .{
+            .shape = world.handleOf(index),
+            .body = entry.body,
+            .point = self.origin.mulAdd(self.translation, hit.fraction),
             .normal = hit.normal,
             .fraction = hit.fraction,
         };
+        return hit.fraction;
     }
-    return best;
+};
+
+/// The handle of the shape in a live slot.
+fn handleOf(self: *World, index: u32) ShapeId {
+    return .{ .index = index, .generation = self.shapes.slots.items[index].generation };
 }
 
 const LocalHit = struct { fraction: f32, normal: Vec2 };
@@ -1399,36 +1771,69 @@ fn rayAgainst(g: *const shape_mod.Geometry, xf: Transform, origin: Vec2, transla
     }
 }
 
-/// The first shape under a point, or null. Slot order, so a game that
-/// wants the topmost of several should ask `overlapAabb` and choose.
+/// The first shape under a point, or null: a moving one if any is, else
+/// the level's. Which of several is first is not promised, so a game that
+/// wants the topmost should ask `overlapAabb` and choose.
 pub fn overlapPoint(self: *World, point: Vec2) ?ShapeId {
-    var it = self.shapes.iterator();
-    while (it.next()) |entry| {
-        const xf = self.bodyAt(entry.value.body_index).transform;
-        const local = xf.unapply(point);
-        const inside = switch (entry.value.def.geometry) {
-            .circle => |c| local.distSq(c.center) <= c.radius * c.radius,
-            .polygon => |*p| p.containsLocal(local),
-        };
-        if (inside) return entry.handle;
+    for (self.sweep.order.items) |index| {
+        const b = self.bodyAt(self.shapes.slots.items[index].value.?.body_index);
+        if (!pointNears(b, point)) continue;
+        if (self.containsPoint(index, point)) return self.handleOf(index);
     }
-    return null;
+    const Probe = struct {
+        world: *World,
+        point: Vec2,
+        found: ?ShapeId = null,
+
+        fn visit(p: *@This(), index: u32) bool {
+            if (!p.world.containsPoint(index, p.point)) return true;
+            p.found = p.world.handleOf(index);
+            return false;
+        }
+    };
+    var probe: Probe = .{ .world = self, .point = point };
+    self.static_tree.query(.{ .min = point, .max = point }, &probe, Probe.visit);
+    return probe.found;
+}
+
+fn containsPoint(self: *World, index: u32, point: Vec2) bool {
+    const entry = &self.shapes.slots.items[index].value.?;
+    const local = self.bodyAt(entry.body_index).transform.unapply(point);
+    return switch (entry.def.geometry) {
+        .circle => |c| local.distSq(c.center) <= c.radius * c.radius,
+        .polygon => |*p| p.containsLocal(local),
+    };
 }
 
 /// Call `visit(context, shape)` for every shape whose box overlaps `box`,
-/// until it returns false.
+/// until it returns false: the moving shapes, then the level's.
 pub fn overlapAabb(
     self: *World,
     box: Aabb,
     context: anytype,
     comptime visit: fn (@TypeOf(context), ShapeId) bool,
 ) void {
-    var it = self.shapes.iterator();
-    while (it.next()) |entry| {
-        const xf = self.bodyAt(entry.value.body_index).transform;
-        if (!entry.value.def.geometry.aabb(xf).overlaps(box)) continue;
-        if (!visit(context, entry.handle)) return;
+    for (self.sweep.order.items) |index| {
+        const entry = &self.shapes.slots.items[index].value.?;
+        const b = self.bodyAt(entry.body_index);
+        if (!boxNears(b, box)) continue;
+        if (!entry.def.geometry.aabb(b.transform).overlaps(box)) continue;
+        if (!visit(context, self.handleOf(index))) return;
     }
+    // A struct declared inside a function may use the function's
+    // `comptime` parameters - here `visit` - which is how the tree's
+    // visitor, which knows nothing of handles, hands each leaf on to the
+    // caller's as one.
+    const Probe = struct {
+        world: *World,
+        context: @TypeOf(context),
+
+        fn each(p: *@This(), index: u32) bool {
+            return visit(p.context, p.world.handleOf(index));
+        }
+    };
+    var probe: Probe = .{ .world = self, .context = context };
+    self.static_tree.query(box, &probe, Probe.each);
 }
 
 // -------------------------------------------------------------------------

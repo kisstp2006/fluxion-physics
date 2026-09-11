@@ -22,11 +22,11 @@
 //! deterministic: the solver's colouring walks the pairs in this order and
 //! gives the same contact the same colour on every run.
 //!
-//! What this is not: a tree. A dynamic AABB tree answers a ray or a box
-//! query in logarithmic time and a sweep answers it in linear time, so the
-//! queries in `World` walk every shape. A tree is the next thing this file
-//! grows if a game asks a thousand questions a frame; the pair-finding
-//! would stay a sweep, which for pairs is the faster of the two.
+//! **Only the shapes that move are in it.** The level - everything static -
+//! is in a `Tree`, which each moving shape asks what is near. A sweep over
+//! a tile map would be at its worst: every tile in a column overlaps every
+//! other along x. For pairs among things that move, which are few and move
+//! a little each step, the sweep is the faster of the two.
 
 const std = @import("std");
 const testing = std.testing;
