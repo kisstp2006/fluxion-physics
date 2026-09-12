@@ -9,6 +9,12 @@
 //! added or taken away, is where it now is from the next step on. What it
 //! must change is the cost: a step over a level of thousands of tiles looks
 //! at the few that are near something moving.
+//!
+//! And the seams between its tiles must not be felt. A box slid slowly
+//! across a floor of tiles used to be stopped dead at a seam; now it, a
+//! rolling ball and a box pushed along as a
+//! character is all go as they would on one slab - while an edge that
+//! nothing covers, a step, stops them as before.
 
 const std = @import("std");
 const testing = std.testing;
@@ -207,6 +213,153 @@ test "a tile taken away or added between steps is gone or there from the next st
     _ = try world.addShape(ledge, .box(0.25, 0.25));
     try steps(&world, &jobs, 90);
     try testing.expectApproxEqAbs(@as(f32, -1.45), world.body(crate).?.position().y, 0.01);
+}
+
+// -------------------------------------------------------------------------
+// Seams
+// -------------------------------------------------------------------------
+
+const Floor = enum { body_per_tile, one_body, sizes_mixed };
+
+/// A floor of tiles, its top at y = 0, from x = -2 for `width` metres - a
+/// body a half-metre tile, the same tiles on one body, or tiles of half a
+/// metre and a metre by turns.
+fn tiledFloor(world: *World, floor: Floor, width: f32) !void {
+    const level = if (floor == .one_body) try world.createBody(.{ .type = .static }) else undefined;
+    var x: f32 = -2;
+    var i: usize = 0;
+    while (x < width - 2) : (i += 1) {
+        const half: f32 = if (floor == .sizes_mixed and i % 2 == 1) 0.5 else 0.25;
+        const at: Vec2 = .init(x + half, 0.25);
+        if (floor == .one_body) {
+            _ = try world.addShape(level, .{ .geometry = .{ .polygon = .offsetBox(half, 0.25, at, 0) } });
+        } else {
+            const tile = try world.createBody(.{ .type = .static, .position = at });
+            _ = try world.addShape(tile, .box(half, 0.25));
+        }
+        x += 2 * half;
+    }
+}
+
+test "a box slid slowly across a floor of tiles keeps its speed at every seam" {
+    // A resting box sits a slop deep in the tile under it, so the next
+    // tile's side is met before its top. Frictionless, nothing should take
+    // any speed away: at these speeds a box used to be stopped dead.
+    for ([_]Floor{ .body_per_tile, .one_body, .sizes_mixed }) |floor| {
+        for ([_]f32{ 0.5, 1, 3 }) |speed| {
+            var jobs: Jobs = try .init(gpa, .{});
+            defer jobs.deinit();
+            var world: World = .init(gpa, .{});
+            defer world.deinit();
+            try tiledFloor(&world, floor, 12);
+            const box = try world.createBody(.{ .position = .init(0, -0.2), .allow_sleep = false });
+            _ = try world.addShape(box, .{ .geometry = .{ .polygon = .box(0.2, 0.2) }, .material = .{ .friction = 0 } });
+            try steps(&world, &jobs, 30);
+            world.body(box).?.linear_velocity = .init(speed, 0);
+
+            // Three metres: six seams or more.
+            const n: usize = @intFromFloat(3 / (speed * dt));
+            try steps(&world, &jobs, n);
+            const b = world.body(box).?;
+            try testing.expectApproxEqRel(speed, b.linear_velocity.x, 0.01);
+            try testing.expectApproxEqAbs(speed * dt * @as(f32, @floatFromInt(n)), b.position().x, 0.03);
+            try testing.expect(@abs(b.angle) < 0.01);
+        }
+    }
+}
+
+test "down a wall of tiles, a ball rolling, a box pushed along: all as on a slab" {
+    var jobs: Jobs = try .init(gpa, .{});
+    defer jobs.deinit();
+
+    // A wall of tiles with gravity pulling into it: a floor on its side. A
+    // box slides down it at half a metre a second and keeps that.
+    {
+        var world: World = .init(gpa, .{ .gravity = .init(9.81, 0) });
+        defer world.deinit();
+        for (0..24) |i| {
+            const tile = try world.createBody(.{ .type = .static, .position = .init(0.25, -1.75 + @as(f32, @floatFromInt(i)) * 0.5) });
+            _ = try world.addShape(tile, .box(0.25, 0.25));
+        }
+        const box = try world.createBody(.{ .position = .init(-0.2, 0), .allow_sleep = false });
+        _ = try world.addShape(box, .{ .geometry = .{ .polygon = .box(0.2, 0.2) }, .material = .{ .friction = 0 } });
+        try steps(&world, &jobs, 30);
+        world.body(box).?.linear_velocity = .init(0, 0.5);
+        try steps(&world, &jobs, 240);
+        try testing.expectApproxEqRel(@as(f32, 0.5), world.body(box).?.linear_velocity.y, 0.01);
+    }
+
+    // A ball, with friction, rolling at three metres a second over tiles and
+    // over one slab, and a box with friction pushed along each with twice
+    // the force it takes to start it sliding, as a character is: the same
+    // speeds on both, where the pushed box used to stick at a seam.
+    var rolled: [2]f32 = undefined;
+    var pushed: [2]f32 = undefined;
+    for ([_]bool{ true, false }, 0..) |tiles, k| {
+        var world: World = .init(gpa, .{});
+        defer world.deinit();
+        if (tiles) {
+            try tiledFloor(&world, .body_per_tile, 20);
+        } else {
+            const slab = try world.createBody(.{ .type = .static, .position = .init(8, 0.25) });
+            _ = try world.addShape(slab, .box(10, 0.25));
+        }
+        const ball = try world.createBody(.{ .position = .init(0, -0.2), .allow_sleep = false });
+        _ = try world.addShape(ball, .circle(0.2));
+        const box = try world.createBody(.{ .position = .init(0, -1.2), .fixed_rotation = true, .allow_sleep = false });
+        _ = try world.addShape(box, .{ .geometry = .{ .polygon = .box(0.2, 0.2) }, .material = .{ .friction = 0.3 } });
+        // The box rides a second floor, a metre up, of the same kind.
+        if (tiles) {
+            for (0..40) |i| {
+                const tile = try world.createBody(.{ .type = .static, .position = .init(-1.75 + @as(f32, @floatFromInt(i)) * 0.5, -0.75) });
+                _ = try world.addShape(tile, .box(0.25, 0.25));
+            }
+        } else {
+            const slab = try world.createBody(.{ .type = .static, .position = .init(8, -0.75) });
+            _ = try world.addShape(slab, .box(10, 0.25));
+        }
+        try steps(&world, &jobs, 30);
+        world.body(ball).?.linear_velocity = .init(3, 0);
+        world.body(ball).?.angular_velocity = 3.0 / 0.2;
+        const mass = world.body(box).?.mass;
+        const mu = @sqrt(0.3 * 0.6);
+        for (0..90) |_| {
+            world.body(box).?.applyForce(.init(2 * mu * mass * 9.81, 0));
+            try world.step(dt, &jobs);
+        }
+        rolled[k] = world.body(ball).?.linear_velocity.x;
+        pushed[k] = world.body(box).?.linear_velocity.x;
+    }
+    try testing.expectApproxEqRel(rolled[1], rolled[0], 0.01);
+    try testing.expectApproxEqRel(pushed[1], pushed[0], 0.01);
+    try testing.expect(pushed[0] > 5);
+}
+
+test "an edge of the level that nothing covers still stops what hits it" {
+    // A step one tile high in a floor of tiles: its face covers nothing and
+    // nothing covers it. A box sliding into it gets there - no seam on the
+    // way stops it - and is never found more than a slop inside it.
+    var jobs: Jobs = try .init(gpa, .{});
+    defer jobs.deinit();
+    var world: World = .init(gpa, .{});
+    defer world.deinit();
+    try tiledFloor(&world, .body_per_tile, 12);
+    for (0..6) |i| {
+        const tile = try world.createBody(.{ .type = .static, .position = .init(3.25 + @as(f32, @floatFromInt(i)) * 0.5, -0.25) });
+        _ = try world.addShape(tile, .box(0.25, 0.25));
+    }
+    const box = try world.createBody(.{ .position = .init(0, -0.2) });
+    _ = try world.addShape(box, .{ .geometry = .{ .polygon = .box(0.2, 0.2) }, .material = .{ .friction = 0 } });
+    try steps(&world, &jobs, 30);
+    world.body(box).?.linear_velocity = .init(1, 0);
+    var furthest: f32 = 0;
+    for (0..240) |_| {
+        try world.step(dt, &jobs);
+        const x = world.body(box).?.position().x;
+        try testing.expect(x < 3 - 0.2 + 0.01);
+        furthest = @max(furthest, x);
+    }
+    try testing.expect(furthest > 3 - 0.2 - 0.01);
 }
 
 test "a step over seven thousand tiles pairs a crate with the few it is near" {

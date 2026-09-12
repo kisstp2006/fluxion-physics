@@ -145,6 +145,39 @@ in the tree at the next step, and whatever slept on it wakes. That costs a
 walk over the bodies, because a body cannot tell the world it was moved;
 moving platforms want a kinematic body anyway.
 
+**Seams between tiles are smooth.** A floor of separate tiles is a row of
+boxes whose sides touch, and the narrow phase sees one tile at a time: a
+box resting a slop deep in one tile meets the side of the next before it
+meets its top, and is pushed back - stopped dead, sliding slowly across a
+seam. So when something first comes near a piece of the level, the world
+works out which of its edges another solid piece covers: tiles that meet
+exactly, tiles of different sizes along one edge, tiles a few millimetres
+apart or overlapping, as a level placed by hand comes out. No contact is
+made against a covered edge, and a corner with one covered side is not a
+corner, but the other side running straight on. This is what Jolt and
+Bullet do for the triangles of a mesh; Box2D asks for the level as a chain
+of segments instead. It applies only to shallow contacts: something sunk
+deep into the level is pushed out the shortest way, covered or not, as it
+always was, rather than being let fall through it. Frictionless, over three
+metres of half-metre tiles:
+
+| | Before | Now |
+| --- | --- | --- |
+| a box sliding at 0.5 and 1 m/s | stopped dead at a seam | keeps all its speed |
+| a box sliding at 3 m/s | kept 31% of its speed | keeps all of it |
+| a ball sliding at 0.5 and 1 m/s | kept 2% and 41% | keeps all of it |
+| a ball rolling at 3 m/s, with friction, after 4 s | 2.72 m/s | 2.99 m/s, as on a slab |
+| a box pushed with twice the force it takes to slide it, as a character is | stuck at a seam 4.8 m along | 12.5 m/s after 3 s, as on a slab |
+
+The same holds down a wall of tiles, over tiles of mixed sizes, and with the
+tiles as a body each or all on one body. An edge nothing covers - a step,
+the rim of a pit - stops things as before; a sensor, or a piece with
+another filter, covers nothing, since something may pass through it and
+stop at its neighbour. Which edges are covered is worked out lazily, for
+the tiles something comes near, and again when a piece near them comes,
+goes or moves; the scenes above that have no seams come out the same to the
+bit, and as fast.
+
 ## Fast bodies
 
 A step finds what touches from where the bodies are, and then moves them.
@@ -302,17 +335,9 @@ const ragdoll_part: physics.Filter = .{ .group = -7 };               // never to
 
 Each of these is a known piece of work, listed with what it would take.
 
-- **Smooth seams between tiles.** A box sliding slowly over a floor of
-  separate tiles catches on the seams: resting a slop into one tile, it
-  meets the next tile's side before its top, and the narrow phase, which
-  sees one tile at a time, pushes it back. Measured, frictionless: at 0.5
-  and 1 m/s the box is stopped dead at a seam, at 3 m/s it loses two thirds
-  of its speed, from 10 m/s it skips over them; a ball at 1 m/s loses four
-  fifths. On one long slab, nothing. Box2D's answer is chain shapes, a
-  one-sided outline built by hand; Jolt and Bullet find the internal edges -
-  sides covered by a neighbour - and leave them out of the narrow phase,
-  which here would be done when a static shape goes into the tree. Until
-  then: merge runs of tiles into longer boxes.
+- **Seams in what moves.** Only the level's pieces cover each other's
+  edges. A moving platform built of several boxes on one kinematic body
+  still has seams; build it of one box.
 - **Fast bodies against fast bodies, and a pile.** The sweep puts a fast body
   back against the level, and a bullet against the other moving bodies where
   they ended the step; two bullets do not see each other, and a kinematic
@@ -371,7 +396,11 @@ fail then; a box crosses a tiled floor at 60 m/s without losing speed; six
 hundred shots come out the same with workers and without. The level's tree
 answers every ray, point and box exactly as a walk over every shape does,
 and a step over seven thousand tiles pairs a resting crate with the tiles
-under it and nothing else. The browser build is part of
+under it and nothing else. A box slides across tiles of every build at half
+a metre a second without losing speed; a ball rolls and a pushed box runs
+as on a slab; a step of tiles still stops what hits it; and which edges are
+covered is checked piece by piece - a grid, mixed sizes, a gap, a filter,
+a sensor, a tile taken away, a tile moved. The browser build is part of
 `zig build test`, so a change that breaks the no-thread path fails here and
 not in a browser later.
 

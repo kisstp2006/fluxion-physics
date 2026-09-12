@@ -3,7 +3,7 @@
 //! The narrow phase: given two shapes that might touch, where and how deep.
 //!
 //! ```zig
-//! const m = collide.polygons(&crate, crate_xf, &ramp, ramp_xf, 0);
+//! const m = collide.polygons(&crate, crate_xf, &ramp, ramp_xf, 0, .none);
 //! for (m.points[0..m.count]) |p| { ... p.point, p.separation ... }
 //! ```
 //!
@@ -25,6 +25,20 @@
 //! clipped against it, and the circle cases by regions of a polygon. It is
 //! well understood and its failure modes are known, which for a solver is
 //! worth more than novelty.
+//!
+//! **`hidden` marks the edges of a polygon that another piece of the level
+//! covers**, one bit an edge (`Hidden`). A floor of separate tiles is a row
+//! of boxes whose sides touch, and to the narrow phase, which sees one tile
+//! at a time, the side of the next tile along is a wall: a box resting a
+//! slop deep in one tile meets it before it meets that tile's top, and is
+//! pushed back - stopped dead, sliding slowly across a seam. No contact is
+//! made against a hidden edge. Between two polygons, the shallowest way out
+//! that is not through one is used instead; a circle beyond one is left to
+//! the tile that covers it; and a corner with a hidden edge on one side is
+//! not a corner at all, but the other edge running straight on. Jolt and
+//! Bullet do the same for the triangles of a mesh; Box2D asks for the level
+//! as a chain of segments instead. The world works out which edges are
+//! hidden - see `World.coverEdges`.
 //!
 //! **`margin` reaches a little past touching.** With a margin of zero a
 //! manifold is only ever made of points that are touching or sunk in. With
@@ -76,6 +90,44 @@ pub const Manifold = struct {
     }
 };
 
+/// Which edges of a polygon are hidden, bit `i` for edge `i` - the one from
+/// vertex `i` to the next. See the module comment. Eight bits, because a
+/// polygon has eight edges at most.
+pub const Hidden = u8;
+
+/// Nothing hidden: every shape that is not part of the level.
+pub const none_hidden: Hidden = 0;
+
+inline fn isHidden(hidden: Hidden, edge: usize) bool {
+    return hidden & (@as(Hidden, 1) << @intCast(edge)) != 0;
+}
+
+/// What a pairing is told about the seams of the level: which edges of
+/// each shape are hidden, and how deep a contact may be and still be one
+/// made at a seam.
+///
+/// Only a shallow contact is a seam's: a box sliding over one has sunk the
+/// slop a resting box sinks, no more. Deeper, the shape has been pushed
+/// into the level, and is pushed out the way it would have been had there
+/// been no seam - whichever way is shortest, covered or not - because a
+/// shape sunk into the middle of a floor that every tile declined to push
+/// would fall through it.
+pub const Seams = struct {
+    /// Shape A's hidden edges, and shape B's.
+    a: Hidden = none_hidden,
+    b: Hidden = none_hidden,
+    /// The deepest a contact may be and still be a seam's. World units.
+    depth: f32 = 0,
+
+    /// No seams: two shapes that are not both part of a level.
+    pub const none: Seams = .{};
+
+    /// The same, for the pairing written the other way round.
+    pub fn swapped(self: Seams) Seams {
+        return .{ .a = self.b, .b = self.a, .depth = self.depth };
+    }
+};
+
 /// A tolerance the tests below use where a division would otherwise be by
 /// something that is zero to the bit only by luck.
 const eps: f32 = std.math.floatEps(f32);
@@ -112,7 +164,9 @@ pub fn circles(a: Circle, xa: Transform, b: Circle, xb: Transform, margin: f32) 
 // -------------------------------------------------------------------------
 
 /// The polygon is shape A, so the normal points from it towards the circle.
-pub fn polygonCircle(poly: *const Polygon, xa: Transform, circle: Circle, xb: Transform, margin: f32) Manifold {
+/// `seams.a`: the polygon's covered edges; see `Seams`.
+pub fn polygonCircle(poly: *const Polygon, xa: Transform, circle: Circle, xb: Transform, margin: f32, seams: Seams) Manifold {
+    const hidden = seams.a;
     // The circle's centre in the polygon's frame, where the polygon's
     // normals mean something.
     const c_world = xb.apply(circle.center);
@@ -134,27 +188,67 @@ pub fn polygonCircle(poly: *const Polygon, xa: Transform, circle: Circle, xb: Tr
         }
     }
 
-    const v1 = poly.vertices[best];
-    const v2 = poly.vertices[(best + 1) % poly.count];
-    const n_local = poly.normals[best];
-
-    // The centre is inside the polygon. The nearest face is the way out.
+    // The centre is inside the polygon. The nearest face is the way out -
+    // and when that is a hidden one and the circle is only just in, the
+    // nearest that is not, if that is as shallow; if it is not, the piece
+    // covering the hidden face holds the circle, not this one.
     if (separation < eps) {
-        const normal = xa.q.rotate(n_local);
-        return facePoint(c_world, normal, radius, separation, @intCast(best));
+        var face = best;
+        if (isHidden(hidden, best) and radius - separation <= seams.depth) {
+            var open = -std.math.floatMax(f32);
+            var found = false;
+            for (poly.vertexSlice(), poly.normalSlice(), 0..) |v, n, i| {
+                if (isHidden(hidden, i)) continue;
+                const s = n.dot(c.sub(v));
+                if (s > open) {
+                    open = s;
+                    face = i;
+                    found = true;
+                }
+            }
+            if (!found or radius - open > seams.depth) return .none;
+            separation = open;
+        }
+        return facePoint(c_world, xa.q.rotate(poly.normals[face]), radius, separation, @intCast(face));
     }
 
     // Which part of the face is nearest: past one end, past the other, or
     // the face itself.
+    const v1 = poly.vertices[best];
+    const v2 = poly.vertices[(best + 1) % poly.count];
     const along1 = c.sub(v1).dot(v2.sub(v1));
     const along2 = c.sub(v2).dot(v1.sub(v2));
-    if (along1 <= 0) return vertexPoint(xa, c_world, v1, radius, reach, 0x100 | @as(u16, @intCast(best)));
-    if (along2 <= 0) return vertexPoint(xa, c_world, v2, radius, reach, 0x100 | @as(u16, @intCast((best + 1) % poly.count)));
+    if (along1 <= 0) return cornerPoint(poly, xa, c_world, c, best, radius, reach, seams);
+    if (along2 <= 0) return cornerPoint(poly, xa, c_world, c, (best + 1) % poly.count, radius, reach, seams);
 
-    const face_center = v1.add(v2).scale(0.5);
-    const s = c.sub(face_center).dot(n_local);
+    const n_local = poly.normals[best];
+    const s = c.sub(v1.add(v2).scale(0.5)).dot(n_local);
     if (s > reach) return .none;
+    // Just over a hidden face is the piece of level that hides it, and the
+    // circle is resting on that one's face, not this one's side.
+    if (isHidden(hidden, best) and radius - s <= seams.depth) return .none;
     return facePoint(c_world, xa.q.rotate(n_local), radius, s, @intCast(best));
+}
+
+/// The circle's centre is nearest corner `k`, between edge `k - 1` and edge
+/// `k`. A corner with a hidden edge on one side is not a corner: the
+/// surface runs straight on through it, so a shallow contact there is with
+/// the edge that is not hidden, as though the circle were over its middle.
+/// With both sides hidden it is inside the level, and the pieces around it
+/// hold the circle.
+fn cornerPoint(poly: *const Polygon, xa: Transform, c_world: Vec2, c: Vec2, k: usize, radius: f32, reach: f32, seams: Seams) Manifold {
+    const corner = poly.vertices[k];
+    const before = (k + poly.count - 1) % poly.count;
+    const hide_before = isHidden(seams.a, before);
+    const hide_after = isHidden(seams.a, k);
+    const plain = (!hide_before and !hide_after) or radius - c.dist(corner) > seams.depth;
+    if (plain) return vertexPoint(xa, c_world, corner, radius, reach, 0x100 | @as(u16, @intCast(k)));
+    if (hide_before and hide_after) return .none;
+    const face = if (hide_before) k else before;
+    const n = poly.normals[face];
+    const s = n.dot(c.sub(corner));
+    if (s > reach) return .none;
+    return facePoint(c_world, xa.q.rotate(n), radius, s, @intCast(face));
 }
 
 /// The circle's centre is `distance` outside a face with world `normal`:
@@ -240,12 +334,35 @@ fn findMaxSeparation(poly1: *const Polygon, xf1: Transform, poly2: *const Polygo
     return .{ .edge = best, .separation = max_separation };
 }
 
-/// The edge of `poly2` most nearly facing `edge1` of `poly1`: the one to be
-/// clipped against the reference face. In world coordinates.
-fn findIncidentEdge(poly1: *const Polygon, xf1: Transform, edge1: usize, poly2: *const Polygon, xf2: Transform, flipped: bool) [2]ClipVertex {
+/// Like `findMaxSeparation`, but only among the faces that may make a
+/// contact: not hidden themselves, and not facing a hidden edge of `poly2`
+/// - which is the edge the contact would be made against. Null when there
+/// are none.
+fn findMaxVisibleSeparation(poly1: *const Polygon, xf1: Transform, hidden1: Hidden, poly2: *const Polygon, xf2: Transform, hidden2: Hidden) ?struct { edge: usize, separation: f32 } {
+    const xf = xf2.invMul(xf1);
+    var best: ?usize = null;
+    var max_separation: f32 = -std.math.floatMax(f32);
+    for (poly1.vertexSlice(), poly1.normalSlice(), 0..) |v1_local, n1_local, i| {
+        if (isHidden(hidden1, i)) continue;
+        const n = xf.q.rotate(n1_local);
+        const v1 = xf.apply(v1_local);
+        var si: f32 = std.math.floatMax(f32);
+        for (poly2.vertexSlice()) |v2| {
+            si = @min(si, n.dot(v2.sub(v1)));
+        }
+        if (si <= max_separation) continue;
+        if (isHidden(hidden2, incidentIndex(poly1, xf1, i, poly2, xf2))) continue;
+        max_separation = si;
+        best = i;
+    }
+    const edge = best orelse return null;
+    return .{ .edge = edge, .separation = max_separation };
+}
+
+/// Which edge of `poly2` most nearly faces `edge1` of `poly1`.
+fn incidentIndex(poly1: *const Polygon, xf1: Transform, edge1: usize, poly2: *const Polygon, xf2: Transform) usize {
     // The reference normal, in poly2's frame.
     const normal1 = xf2.q.invRotate(xf1.q.rotate(poly1.normals[edge1]));
-
     var index: usize = 0;
     var min_dot: f32 = std.math.floatMax(f32);
     for (poly2.normalSlice(), 0..) |n2, i| {
@@ -255,8 +372,14 @@ fn findIncidentEdge(poly1: *const Polygon, xf1: Transform, edge1: usize, poly2: 
             index = i;
         }
     }
-    const first = index;
-    const second = (index + 1) % poly2.count;
+    return index;
+}
+
+/// The edge of `poly2` most nearly facing `edge1` of `poly1`: the one to be
+/// clipped against the reference face. In world coordinates.
+fn findIncidentEdge(poly1: *const Polygon, xf1: Transform, edge1: usize, poly2: *const Polygon, xf2: Transform, flipped: bool) [2]ClipVertex {
+    const first = incidentIndex(poly1, xf1, edge1, poly2, xf2);
+    const second = (first + 1) % poly2.count;
 
     return .{
         .{
@@ -307,8 +430,9 @@ fn clipSegment(in: [2]ClipVertex, normal: Vec2, offset: f32, vertex_index_a: usi
     return .{ .out = out, .count = count };
 }
 
-/// Two convex polygons. The normal points from A towards B.
-pub fn polygons(a: *const Polygon, xa: Transform, b: *const Polygon, xb: Transform, margin: f32) Manifold {
+/// Two convex polygons. The normal points from A towards B. `seams`: each
+/// one's covered edges; see `Seams`.
+pub fn polygons(a: *const Polygon, xa: Transform, b: *const Polygon, xb: Transform, margin: f32, seams: Seams) Manifold {
     const from_a = findMaxSeparation(a, xa, b, xb);
     if (from_a.separation > margin) return .none;
     const from_b = findMaxSeparation(b, xb, a, xa);
@@ -318,13 +442,38 @@ pub fn polygons(a: *const Polygon, xa: Transform, b: *const Polygon, xb: Transfo
     // is clearly better, so a pair whose two candidates are nearly equal
     // does not flip between them every step and shake.
     const tolerance: f32 = 0.1 * 0.005;
-    const flip = from_b.separation > 0.98 * from_a.separation + tolerance;
+    var flip = from_b.separation > 0.98 * from_a.separation + tolerance;
+    var edge1 = if (flip) from_b.edge else from_a.edge;
+
+    // The shallowest way out may be through an edge of the level that the
+    // next piece covers: the side of the next tile of a floor, met by a box
+    // sunk a slop into this one. Then, if the box is only that shallowly in,
+    // the shallowest way out that exists is used instead - out through the
+    // top - provided it is as shallow; if it is not, the box is not on this
+    // piece's surface at all, and the pieces around it hold it. Only when
+    // something is hidden; and the usual answer whenever it is allowed.
+    if ((seams.a | seams.b) != none_hidden) {
+        const allowed = if (flip)
+            !isHidden(seams.b, edge1) and !isHidden(seams.a, incidentIndex(b, xb, edge1, a, xa))
+        else
+            !isHidden(seams.a, edge1) and !isHidden(seams.b, incidentIndex(a, xa, edge1, b, xb));
+        const shallow = @max(from_a.separation, from_b.separation) >= -seams.depth;
+        if (!allowed and shallow) {
+            const open_a = findMaxVisibleSeparation(a, xa, seams.a, b, xb, seams.b);
+            const open_b = findMaxVisibleSeparation(b, xb, seams.b, a, xa, seams.a);
+            const deep = -seams.depth;
+            const ok_a = open_a != null and open_a.?.separation >= deep;
+            const ok_b = open_b != null and open_b.?.separation >= deep;
+            if (!ok_a and !ok_b) return .none;
+            flip = if (!ok_a) true else if (!ok_b) false else open_b.?.separation > 0.98 * open_a.?.separation + tolerance;
+            edge1 = if (flip) open_b.?.edge else open_a.?.edge;
+        }
+    }
 
     const poly1 = if (flip) b else a;
     const poly2 = if (flip) a else b;
     const xf1 = if (flip) xb else xa;
     const xf2 = if (flip) xa else xb;
-    const edge1 = if (flip) from_b.edge else from_a.edge;
 
     const incident = findIncidentEdge(poly1, xf1, edge1, poly2, xf2, flip);
 
@@ -390,24 +539,24 @@ test "a circle on a box's face, corner, and inside it" {
     const ball: Circle = .{ .radius = 0.5 };
 
     // Sitting on the face at +y, slightly inside.
-    const on_face = polygonCircle(&box, .identity, ball, .init(.init(0.3, 1.4), 0), 0);
+    const on_face = polygonCircle(&box, .identity, ball, .init(.init(0.3, 1.4), 0), 0, .none);
     try testing.expectEqual(@as(u32, 1), on_face.count);
     try testing.expect(on_face.normal.approxEql(.unit_y));
     try testing.expectApproxEqAbs(@as(f32, -0.1), on_face.points[0].separation, 1e-6);
     try testing.expectApproxEqAbs(@as(f32, 0.3), on_face.points[0].point.x, 1e-6);
 
     // Off the corner, diagonally.
-    const at_corner = polygonCircle(&box, .identity, ball, .init(.init(1.3, 1.3), 0), 0);
+    const at_corner = polygonCircle(&box, .identity, ball, .init(.init(1.3, 1.3), 0), 0, .none);
     try testing.expectEqual(@as(u32, 1), at_corner.count);
     try testing.expectApproxEqAbs(@as(f32, 1.0 / @sqrt(2.0)), at_corner.normal.x, 1e-5);
     try testing.expect(at_corner.points[0].separation < 0);
     try testing.expect(at_corner.points[0].id != on_face.points[0].id);
 
     // Past the corner, not touching.
-    try testing.expectEqual(@as(u32, 0), polygonCircle(&box, .identity, ball, .init(.init(1.4, 1.4), 0), 0).count);
+    try testing.expectEqual(@as(u32, 0), polygonCircle(&box, .identity, ball, .init(.init(1.4, 1.4), 0), 0, .none).count);
 
     // Deep inside: pushed out of the nearest face, which is +x here.
-    const inside = polygonCircle(&box, .identity, ball, .init(.init(0.8, 0.1), 0), 0);
+    const inside = polygonCircle(&box, .identity, ball, .init(.init(0.8, 0.1), 0), 0, .none);
     try testing.expectEqual(@as(u32, 1), inside.count);
     try testing.expect(inside.normal.approxEql(.unit_x));
     try testing.expectApproxEqAbs(@as(f32, -0.7), inside.points[0].separation, 1e-6);
@@ -417,7 +566,7 @@ test "a box resting on a wider box makes two points and a normal towards it" {
     const ground: Polygon = .box(5, 0.5);
     const crate: Polygon = .box(0.5, 0.5);
     // Ground top at y = -0.5; crate bottom at y = -0.45 is 0.05 inside.
-    const m = polygons(&ground, .identity, &crate, .init(.init(1, -0.95), 0), 0);
+    const m = polygons(&ground, .identity, &crate, .init(.init(1, -0.95), 0), 0, .none);
     try testing.expectEqual(@as(u32, 2), m.count);
     try testing.expect(m.normal.approxEql(.init(0, -1)));
     for (m.pointSlice()) |p| {
@@ -428,12 +577,84 @@ test "a box resting on a wider box makes two points and a normal towards it" {
     try testing.expect(@abs(m.points[0].point.x - m.points[1].point.x) > 0.9);
 
     // The same pair the other way round has the opposite normal.
-    const back = polygons(&crate, .init(.init(1, -0.95), 0), &ground, .identity, 0);
+    const back = polygons(&crate, .init(.init(1, -0.95), 0), &ground, .identity, 0, .none);
     try testing.expectEqual(@as(u32, 2), back.count);
     try testing.expect(back.normal.approxEql(.init(0, 1)));
 
     // Lifted clear, nothing.
-    try testing.expectEqual(@as(u32, 0), polygons(&ground, .identity, &crate, .init(.init(1, -1.2), 0), 0).count);
+    try testing.expectEqual(@as(u32, 0), polygons(&ground, .identity, &crate, .init(.init(1, -1.2), 0), 0, .none).count);
+}
+
+// A tile of a floor whose top is at y = 0, spanning x from 0.5 to 1: the
+// second tile along, the first being where x is below 0.5. Its left edge -
+// edge 3 of a box - is the side the first tile covers.
+const next_tile: Polygon = .box(0.25, 0.25);
+const next_tile_xf: Transform = .init(.init(0.75, 0.25), 0);
+/// The tile with its side covered, as the world would tell it, for four
+/// half-centimetre slops.
+const covered_side: Seams = .{ .a = 1 << 3, .depth = 0.02 };
+
+test "a box crossing a seam meets the next tile's top, not the side the first tile covers" {
+    // Sunk half a centimetre into the first tile, as a resting box is, its
+    // right face three millimetres over the seam.
+    const crate: Polygon = .box(0.2, 0.2);
+    const crate_xf: Transform = .init(.init(0.503 - 0.2, -0.2 + 0.005), 0);
+
+    // Seen alone, the tile's side is the shallowest way out, and the crate
+    // is pushed back across the seam. That is the snag.
+    const alone = polygons(&next_tile, next_tile_xf, &crate, crate_xf, 0, .none);
+    try testing.expect(alone.count > 0);
+    try testing.expect(alone.normal.approxEql(.init(-1, 0)));
+
+    // With that side hidden, the way out is up, by the half centimetre it is
+    // sunk: the crate is standing on the next tile, as it is on the first.
+    const seamless = polygons(&next_tile, next_tile_xf, &crate, crate_xf, 0, covered_side);
+    try testing.expect(seamless.count > 0);
+    try testing.expect(seamless.normal.approxEql(.init(0, -1)));
+    for (seamless.pointSlice()) |p| try testing.expectApproxEqAbs(@as(f32, -0.005), p.separation, 1e-5);
+
+    // The same with the two the other way round, the normal turned with them.
+    const swapped = polygons(&crate, crate_xf, &next_tile, next_tile_xf, 0, covered_side.swapped());
+    try testing.expect(swapped.normal.approxEql(.init(0, 1)));
+
+    // Covered on its top as well - a tile under a step - a box just over
+    // its corner has no shallow way out of it at all, and is left to the
+    // tiles around it. The way out through its far side is most of a tile
+    // deep, and taking it would throw the box.
+    const under_step: Seams = .{ .a = (1 << 3) | (1 << 0), .depth = 0.02 };
+    try testing.expectEqual(@as(u32, 0), polygons(&next_tile, next_tile_xf, &crate, crate_xf, 0, under_step).count);
+}
+
+test "a ball at a seam rests on the next tile's top; deep in a tile, it is pushed out as ever" {
+    const ball: Circle = .{ .radius = 0.2 };
+    // Three centimetres short of the seam, half a centimetre deep.
+    const at_seam: Transform = .init(.init(0.47, -0.195), 0);
+
+    // Alone, the tile's corner is the nearest thing, and it pushes the ball
+    // back and up at once.
+    const alone = polygonCircle(&next_tile, next_tile_xf, ball, at_seam, 0, .none);
+    try testing.expectEqual(@as(u32, 1), alone.count);
+    try testing.expect(alone.normal.x < -0.1);
+
+    // With its side hidden the corner is no corner, and the ball stands on
+    // the tile's top as it does on the first tile's.
+    const seamless = polygonCircle(&next_tile, next_tile_xf, ball, at_seam, 0, covered_side);
+    try testing.expectEqual(@as(u32, 1), seamless.count);
+    try testing.expect(seamless.normal.approxEql(.init(0, -1)));
+    try testing.expectApproxEqAbs(@as(f32, -0.005), seamless.points[0].separation, 1e-5);
+
+    // Just over the seam and covered all round, the tile is inside the
+    // level: the tiles with a way out hold the ball.
+    const covered_all: Seams = .{ .a = 0b1111, .depth = 0.02 };
+    try testing.expectEqual(@as(u32, 0), polygonCircle(&next_tile, next_tile_xf, ball, at_seam, 0, covered_all).count);
+
+    // Sunk far into the tile - past anything a seam does - it is pushed out
+    // the shortest way, hidden or not, as it would be with no seam at all:
+    // out through the side, three centimetres, not the top, ten.
+    const sunk: Transform = .init(.init(0.53, 0.1), 0);
+    const out = polygonCircle(&next_tile, next_tile_xf, ball, sunk, 0, covered_side);
+    try testing.expect(out.normal.approxEql(.init(-1, 0)));
+    try testing.expectApproxEqAbs(@as(f32, -0.23), out.points[0].separation, 1e-5);
 }
 
 test "a margin keeps points that are near, with how far apart they are" {
@@ -444,15 +665,15 @@ test "a margin keeps points that are near, with how far apart they are" {
     const crate_xf: Transform = .init(.init(1, -1.01), 0);
     const ball_xf: Transform = .init(.init(1, -1.01), 0);
 
-    try testing.expectEqual(@as(u32, 0), polygons(&ground, .identity, &crate, crate_xf, 0).count);
-    const near = polygons(&ground, .identity, &crate, crate_xf, 0.02);
+    try testing.expectEqual(@as(u32, 0), polygons(&ground, .identity, &crate, crate_xf, 0, .none).count);
+    const near = polygons(&ground, .identity, &crate, crate_xf, 0.02, .none);
     try testing.expectEqual(@as(u32, 2), near.count);
     for (near.pointSlice()) |p| try testing.expectApproxEqAbs(@as(f32, 0.01), p.separation, 1e-5);
     // And not past the margin.
-    try testing.expectEqual(@as(u32, 0), polygons(&ground, .identity, &crate, crate_xf, 0.005).count);
+    try testing.expectEqual(@as(u32, 0), polygons(&ground, .identity, &crate, crate_xf, 0.005, .none).count);
 
-    try testing.expectEqual(@as(u32, 0), polygonCircle(&ground, .identity, ball, ball_xf, 0).count);
-    const near_ball = polygonCircle(&ground, .identity, ball, ball_xf, 0.02);
+    try testing.expectEqual(@as(u32, 0), polygonCircle(&ground, .identity, ball, ball_xf, 0, .none).count);
+    const near_ball = polygonCircle(&ground, .identity, ball, ball_xf, 0.02, .none);
     try testing.expectEqual(@as(u32, 1), near_ball.count);
     try testing.expectApproxEqAbs(@as(f32, 0.01), near_ball.points[0].separation, 1e-5);
 
@@ -466,7 +687,7 @@ test "a turned box on a face touches at one corner" {
     const crate: Polygon = .box(0.5, 0.5);
     const r = @sqrt(2.0) * 0.5;
     // Balanced on a corner, that corner 0.02 into the ground.
-    const m = polygons(&ground, .identity, &crate, .init(.init(0, -0.5 - r + 0.02), std.math.pi / 4.0), 0);
+    const m = polygons(&ground, .identity, &crate, .init(.init(0, -0.5 - r + 0.02), std.math.pi / 4.0), 0, .none);
     try testing.expectEqual(@as(u32, 1), m.count);
     try testing.expectApproxEqAbs(@as(f32, -0.02), m.points[0].separation, 1e-4);
     try testing.expect(m.normal.approxEql(.init(0, -1)));
@@ -477,7 +698,7 @@ test "ids follow the corners when the incident edge is clipped" {
     // corner, the other is made by the ground's side plane.
     const ground: Polygon = .box(1, 0.5);
     const crate: Polygon = .box(0.5, 0.5);
-    const m = polygons(&ground, .identity, &crate, .init(.init(1.2, -0.98), 0), 0);
+    const m = polygons(&ground, .identity, &crate, .init(.init(1.2, -0.98), 0), 0, .none);
     try testing.expectEqual(@as(u32, 2), m.count);
     const fa: Feature = @bitCast(m.points[0].id);
     const fb: Feature = @bitCast(m.points[1].id);

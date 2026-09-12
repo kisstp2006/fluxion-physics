@@ -25,15 +25,15 @@
         // a browser. Pinned to the same commit `fluxion-ecs` pins, so the
         // scheduler an engine already owns is the one this package takes.
         .fluxion_jobs = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-jobs#e064fb3129f9324b139d7ecbcf75cbd99787dad9",
-            .hash = "fluxion_jobs-0.1.0-FBQYG6HWAAD3RZ_geJ6O5O0UmfH666aT_-DuMCVqJiN1",
+            .url = "git+https://github.com/kisstp2006/fluxion-jobs#92f1340ffcea225567ffb1564b00d276b88fd11f",
+            .hash = "fluxion_jobs-0.1.0-FBQYG6HWAABfncwNFYncNPBVrvx_i16S7Yd-Q6bpvCUW",
         },
 
         // Generational handles: what a body and a shape are known by, so a
         // game holding one to a body that has been destroyed finds nothing
         // rather than whatever took its slot.
         .fluxion_id = .{
-            .url = "git+https://github.com/kisstp2006/fluxion-id#64a04a156031a5d87ead8ce9d4fdb8c78f21ef30",
+            .url = "git+https://github.com/kisstp2006/fluxion-id#a52c29dfe5ac0a49a5d5469cdc1a4fb96b799ccc",
             .hash = "fluxion_id-0.1.0--9Hv-nGFAQAW36SvJvMB6L1nUNErZzh7JC0-nRPlrotw",
         },
     },

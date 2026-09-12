@@ -70,7 +70,9 @@
 //! level and walk only the shapes that move. So a level of thousands of
 //! tiles costs a step what is near the moving bodies - and the passes over
 //! bodies walk only `movers`, so it costs nothing for being thousands of
-//! bodies either.
+//! bodies either. Its seams are smooth: an edge of a piece that another
+//! piece covers makes no contacts, so a box slides across a floor of tiles
+//! as across one slab. See `coverEdges`.
 //!
 //! **Fast bodies are swept.** A step that only looks at where bodies are
 //! lets one pass through a wall thinner than its step. So after the
@@ -176,6 +178,12 @@ pub const ShapeEntry = struct {
     /// Its leaf in `static_tree`, for a shape on a static body; `null_node`
     /// for one that moves, which is in the sweep instead.
     proxy: u32 = Tree.null_node,
+    /// For a polygon of the level, the edges another piece of the level
+    /// covers, which make no contacts. See `coverEdges`.
+    hidden: collide.Hidden = collide.none_hidden,
+    /// Whether `hidden` has been worked out since the level around this
+    /// shape last changed. Worked out when something first comes near.
+    hidden_known: bool = false,
 };
 
 /// Two shapes that started or stopped touching during the last step.
@@ -422,7 +430,7 @@ pub fn addShape(self: *World, body_handle: BodyId, def: Shape) ShapeError!ShapeI
     try self.enrol(handle.index, self.shapes.get(handle).?, owner);
     owner.first_shape = handle;
     owner.shape_count += 1;
-    self.updateMass(body_handle);
+    self.measure(body_handle);
     return handle;
 }
 
@@ -430,7 +438,10 @@ pub fn addShape(self: *World, body_handle: BodyId, def: Shape) ShapeError!ShapeI
 /// level's tree, anything that moves in the sweep.
 fn enrol(self: *World, index: u32, entry: *ShapeEntry, owner: *const Body) Allocator.Error!void {
     if (owner.type == .static) {
-        entry.proxy = try self.static_tree.insert(self.gpa, entry.def.geometry.aabb(owner.transform), index);
+        const box = entry.def.geometry.aabb(owner.transform);
+        // The pieces it now touches may have edges it covers.
+        self.forgetCoverNear(box);
+        entry.proxy = try self.static_tree.insert(self.gpa, box, index);
     } else {
         try self.sweep.add(self.gpa, index);
     }
@@ -438,7 +449,14 @@ fn enrol(self: *World, index: u32, entry: *ShapeEntry, owner: *const Body) Alloc
 
 /// And take it out again.
 fn unenrol(self: *World, index: u32, entry: *const ShapeEntry) void {
-    if (entry.proxy != Tree.null_node) self.static_tree.remove(entry.proxy) else self.sweep.remove(index);
+    if (entry.proxy != Tree.null_node) {
+        // The pieces it touched may have edges it covered.
+        const box = self.static_tree.boxOf(entry.proxy);
+        self.static_tree.remove(entry.proxy);
+        self.forgetCoverNear(box);
+    } else {
+        self.sweep.remove(index);
+    }
 }
 
 /// Take one shape off its body. The body stays, lighter.
@@ -462,11 +480,12 @@ pub fn removeShape(self: *World, handle: ShapeId) void {
     }
     self.unenrol(handle.index, entry);
     _ = self.shapes.remove(handle);
-    self.updateMass(owner_handle);
+    self.measure(owner_handle);
 }
 
 /// The shape, to read or to change its material or filter. Changing its
-/// geometry or density is allowed too; call `updateMass` on the body after.
+/// geometry or density is allowed too; call `updateMass` on the body after,
+/// and after changing the filter of a shape of the level.
 pub fn shape(self: *World, handle: ShapeId) ?*ShapeEntry {
     return self.shapes.get(handle);
 }
@@ -487,13 +506,26 @@ pub fn shapeTransform(self: *World, entry: *const ShapeEntry) Transform {
 }
 
 /// Add up what a body's shapes weigh and where. Called by `addShape` and
-/// `removeShape`; call it yourself after changing a shape's density.
+/// `removeShape`; call it yourself after changing a shape's density - or,
+/// on a static body, a shape's geometry or filter, which moves it in the
+/// level's tree and changes the seams around it: both are worked out again
+/// at the next step.
 ///
 /// A dynamic body with no mass - no shapes, or shapes of zero density -
 /// gets a mass of one rather than infinity, because a body somebody made
 /// dynamic was meant to move. And it wakes: heavier or lighter, it has to
 /// find its feet again.
 pub fn updateMass(self: *World, handle: BodyId) void {
+    self.measure(handle);
+    // As though it had been moved by hand; see `refitMovedLevel`.
+    if (self.bodies.get(handle)) |b| {
+        if (b.type == .static) b.teleported = true;
+    }
+}
+
+/// `updateMass` without the level's refitting, for `addShape` and
+/// `removeShape`, which put the shape in the tree or take it out themselves.
+fn measure(self: *World, handle: BodyId) void {
     const b = self.bodies.get(handle) orelse return;
     b.mass = 0;
     b.inv_mass = 0;
@@ -503,9 +535,15 @@ pub fn updateMass(self: *World, handle: BodyId) void {
 
     if (b.type != .dynamic) {
         b.center = b.transform.p;
-        const extents = self.extentsOf(b);
-        b.extent = extents.reach;
-        b.min_extent = extents.thinnest;
+        // A static body is never swept, and never asked about by the circle
+        // round it - its shapes' boxes are in the level's tree. And a level
+        // built as one body of thousands of tiles would add them all up
+        // again for every tile added.
+        if (b.type == .kinematic) {
+            const extents = self.extentsOf(b);
+            b.extent = extents.reach;
+            b.min_extent = extents.thinnest;
+        }
         return;
     }
 
@@ -703,6 +741,9 @@ const Step = struct {
     toi_target: f32,
     toi_tolerance: f32,
     graze: f32,
+    /// How deep a contact against the level may be and still be one made
+    /// at a seam between two of its pieces. See `collide.Seams`.
+    seam_depth: f32,
 };
 
 /// Advance the world by `dt` seconds, on `jobs`.
@@ -772,6 +813,9 @@ pub fn step(self: *World, dt: f32, jobs: *Jobs) Error!void {
         .toi_target = slop,
         .toi_tolerance = 0.25 * slop,
         .graze = 4 * slop,
+        // A box sliding over a seam has sunk the slop a resting box sinks,
+        // a little more under a load; four is room for both.
+        .seam_depth = 4 * slop,
     };
     self.inv_h = inv_h;
 
@@ -958,9 +1002,158 @@ fn refitMovedLevel(self: *World) Error!void {
         try self.moved_level.append(self.gpa, @intCast(i));
         var cursor = b.first_shape;
         while (self.shapes.get(cursor)) |entry| : (cursor = entry.next) {
-            try self.static_tree.move(self.gpa, entry.proxy, entry.def.geometry.aabb(b.transform));
+            // What it covered where it was, and what it covers now, are
+            // both to be worked out again - and so is what covers it.
+            const box = entry.def.geometry.aabb(b.transform);
+            self.forgetCoverNear(self.static_tree.boxOf(entry.proxy));
+            try self.static_tree.move(self.gpa, entry.proxy, box);
+            self.forgetCoverNear(box);
         }
     }
+}
+
+// -------------------------------------------------------------------------
+// Seams in the level
+// -------------------------------------------------------------------------
+
+/// Work out which edges of a polygon of the level another piece of the
+/// level covers, into `hidden`. See `collide` for why it matters: a box
+/// sliding across a floor of tiles is otherwise stopped at every seam.
+///
+/// An edge is covered when the strip just outside it - a slop out, short of
+/// its corners by a slop - lies wholly inside other solid polygons of the
+/// level with the same filter. Tiles that meet exactly cover each other's
+/// sides; so do tiles of different sizes, several along one edge; so do
+/// tiles a little apart or a little overlapping, which is how a level
+/// placed by hand comes out. A sensor covers nothing, and neither does a
+/// piece with another filter, which something may pass through while it
+/// stops at this one.
+///
+/// Lazily: when something first comes near, from `findLevelPairs`, and
+/// again whenever a piece of the level near it comes, goes or moves - see
+/// `forgetCoverNear`. A level of thousands of tiles costs nothing for the
+/// ones nobody walks on.
+fn coverEdges(self: *World, index: u32) void {
+    const entry = &self.shapes.slots.items[index].value.?;
+    entry.hidden_known = true;
+    entry.hidden = collide.none_hidden;
+    if (entry.def.sensor) return;
+    const poly = switch (entry.def.geometry) {
+        .polygon => |*p| p,
+        .circle => return,
+    };
+    const xf = self.bodyAt(entry.body_index).transform;
+    const reach = self.settings.linear_slop * self.settings.units_per_metre;
+
+    var near: Near = .{ .world = self, .self_index = index, .filter = entry.def.filter };
+    self.static_tree.query(entry.def.geometry.aabb(xf).grow(2 * reach), &near, Near.visit);
+    if (near.count == 0) return;
+
+    for (0..poly.count) |i| {
+        const v0 = xf.apply(poly.vertices[i]);
+        const v1 = xf.apply(poly.vertices[(i + 1) % poly.count]);
+        const out = xf.q.rotate(poly.normals[i]).scale(reach);
+        const along = v1.sub(v0);
+        const length = along.len();
+        // The strip a slop outside the edge, a slop short of each corner so
+        // the corners' rounding does not decide it. An edge too short for
+        // that is asked about at its middle.
+        const in = if (length > 2 * reach) along.scale(reach / length) else along.scale(0.5);
+        if (near.covers(v0.add(in).add(out), v1.sub(in).add(out))) {
+            entry.hidden |= @as(collide.Hidden, 1) << @intCast(i);
+        }
+    }
+}
+
+/// The solid polygons of the level near one being worked out, and whether
+/// they cover a strip beside it.
+const Near = struct {
+    world: *World,
+    self_index: u32,
+    filter: Filter,
+    /// Sixty-four is eight times what a tile in a grid has around it; past
+    /// that the rest are not asked, which can only leave an edge showing.
+    shapes: [64]u32 = undefined,
+    count: usize = 0,
+
+    fn visit(self: *Near, index: u32) bool {
+        if (index == self.self_index) return true;
+        const entry = &self.world.shapes.slots.items[index].value.?;
+        if (entry.def.sensor or entry.def.geometry != .polygon) return true;
+        const f = entry.def.filter;
+        if (f.category != self.filter.category or f.mask != self.filter.mask or f.group != self.filter.group) return true;
+        self.shapes[self.count] = index;
+        self.count += 1;
+        return self.count < self.shapes.len;
+    }
+
+    /// Whether every point from `a` to `b` is inside one or other of them.
+    fn covers(self: *const Near, a: Vec2, b: Vec2) bool {
+        // Each polygon holds one stretch of the segment, being convex; the
+        // stretches, in order, must leave no gap.
+        var stretches: [64][2]f32 = undefined;
+        var n: usize = 0;
+        for (self.shapes[0..self.count]) |index| {
+            const entry = &self.world.shapes.slots.items[index].value.?;
+            const xf = self.world.bodyAt(entry.body_index).transform;
+            if (stretchInside(&entry.def.geometry.polygon, xf.unapply(a), xf.unapply(b))) |s| {
+                stretches[n] = s;
+                n += 1;
+            }
+        }
+        std.sort.pdq([2]f32, stretches[0..n], {}, struct {
+            fn before(_: void, x: [2]f32, y: [2]f32) bool {
+                return x[0] < y[0];
+            }
+        }.before);
+        // A thousandth of the strip is a hair, not a gap.
+        const hair = 1e-3;
+        var reached: f32 = 0;
+        for (stretches[0..n]) |s| {
+            if (s[0] > reached + hair) return false;
+            reached = @max(reached, s[1]);
+        }
+        return reached >= 1 - hair;
+    }
+};
+
+/// The part of the segment from `a` to `b` inside a convex polygon, as
+/// fractions of the way along it - clipped against one face after another,
+/// Cyrus and Beck's way - or null if none of it is. In the polygon's frame.
+fn stretchInside(poly: *const shape_mod.Polygon, a: Vec2, b: Vec2) ?[2]f32 {
+    const d = b.sub(a);
+    var lo: f32 = 0;
+    var hi: f32 = 1;
+    for (poly.vertexSlice(), poly.normalSlice()) |v, n| {
+        // Inside this face's side where n . (a + t d - v) <= 0.
+        const room = n.dot(v.sub(a));
+        const rate = n.dot(d);
+        if (rate == 0) {
+            if (room < 0) return null;
+        } else if (rate > 0) {
+            hi = @min(hi, room / rate);
+        } else {
+            lo = @max(lo, room / rate);
+        }
+        if (lo > hi) return null;
+    }
+    return .{ lo, hi };
+}
+
+/// Every piece of the level near `box` has its covered edges worked out
+/// again the next time something comes near it: a piece next to it has
+/// come, gone or moved.
+fn forgetCoverNear(self: *World, box: Aabb) void {
+    const Forget = struct {
+        world: *World,
+        fn visit(f: *@This(), index: u32) bool {
+            f.world.shapes.slots.items[index].value.?.hidden_known = false;
+            return true;
+        }
+    };
+    const reach = self.settings.linear_slop * self.settings.units_per_metre;
+    var forget: Forget = .{ .world = self };
+    self.static_tree.query(box.grow(2 * reach), &forget, Forget.visit);
 }
 
 /// Every pair of a moving shape and a piece of the level whose boxes
@@ -991,6 +1184,8 @@ const LevelVisitor = struct {
 
     fn visit(self: *LevelVisitor, level_shape: u32) bool {
         if (!acceptPair(self.world, self.shape, level_shape)) return true;
+        // Here, on one thread, before the narrow phase reads it on many.
+        if (!self.world.shapes.slots.items[level_shape].value.?.hidden_known) self.world.coverEdges(level_shape);
         self.world.pairs.append(self.world.gpa, .{
             .a = @min(self.shape, level_shape),
             .b = @max(self.shape, level_shape),
@@ -1034,25 +1229,30 @@ fn narrowPhase(ctx: *const Step, begin: usize, end: usize) void {
         const bb = world.bodyAt(eb.body_index);
         // A body stopped short last step looks ahead; see `Body.stopped_short`.
         const margin = if (ba.stopped_short or bb.stopped_short) ctx.speculative else 0;
-        out.* = manifoldOf(&ea.def.geometry, ba.transform, &eb.def.geometry, bb.transform, margin);
+        // The level's covered edges, from `coverEdges`; nothing that moves
+        // has any.
+        const seams: collide.Seams = .{ .a = ea.hidden, .b = eb.hidden, .depth = ctx.seam_depth };
+        out.* = manifoldOf(&ea.def.geometry, ba.transform, &eb.def.geometry, bb.transform, margin, seams);
     }
 }
 
 /// The right pairing for two geometries, with the normal always from A to
-/// B whichever way round the pairing was written. `margin`: see `collide`.
-pub fn manifoldOf(a: *const shape_mod.Geometry, xa: Transform, b: *const shape_mod.Geometry, xb: Transform, margin: f32) Manifold {
+/// B whichever way round the pairing was written. `margin`, how far past
+/// touching to look, and `seams`, the edges of the level another piece of
+/// it covers: see `collide` for both.
+pub fn manifoldOf(a: *const shape_mod.Geometry, xa: Transform, b: *const shape_mod.Geometry, xb: Transform, margin: f32, seams: collide.Seams) Manifold {
     return switch (a.*) {
         .circle => |ca| switch (b.*) {
             .circle => |cb| collide.circles(ca, xa, cb, xb, margin),
             .polygon => |*pb| blk: {
-                var m = collide.polygonCircle(pb, xb, ca, xa, margin);
+                var m = collide.polygonCircle(pb, xb, ca, xa, margin, seams.swapped());
                 m.normal = m.normal.neg();
                 break :blk m;
             },
         },
         .polygon => |*pa| switch (b.*) {
-            .circle => |cb| collide.polygonCircle(pa, xa, cb, xb, margin),
-            .polygon => |*pb| collide.polygons(pa, xa, pb, xb, margin),
+            .circle => |cb| collide.polygonCircle(pa, xa, cb, xb, margin, seams),
+            .polygon => |*pb| collide.polygons(pa, xa, pb, xb, margin, seams),
         },
     };
 }
@@ -1839,6 +2039,73 @@ pub fn overlapAabb(
 // -------------------------------------------------------------------------
 // Tests
 // -------------------------------------------------------------------------
+
+test "the level knows which edges of its pieces another piece covers" {
+    var world: World = .init(testing.allocator, .{});
+    defer world.deinit();
+
+    // The edges of a box: 0 its top (y is down), 1 its right, 2 its
+    // bottom, 3 its left.
+    const Look = struct {
+        fn hidden(w: *World, s: ShapeId) collide.Hidden {
+            w.coverEdges(s.index);
+            return w.shape(s).?.hidden;
+        }
+        fn tile(w: *World, at: Vec2, def: Shape) !ShapeId {
+            return w.addShape(try w.createBody(.{ .type = .static, .position = at }), def);
+        }
+    };
+    const box: Shape = .box(0.25, 0.25);
+
+    // A block of three by three half-metre tiles: the middle one covered
+    // all round, a corner one on its two inner sides, an edge one on three.
+    var grid: [3][3]ShapeId = undefined;
+    for (0..3) |c| {
+        for (0..3) |r| grid[c][r] = try Look.tile(&world, .init(@as(f32, @floatFromInt(c)) * 0.5, @as(f32, @floatFromInt(r)) * 0.5), box);
+    }
+    try testing.expectEqual(@as(collide.Hidden, 0b1111), Look.hidden(&world, grid[1][1]));
+    try testing.expectEqual(@as(collide.Hidden, 0b0110), Look.hidden(&world, grid[0][0]));
+    try testing.expectEqual(@as(collide.Hidden, 0b1110), Look.hidden(&world, grid[1][0]));
+
+    // A tile a metre wide on two half a metre wide: each covers part of its
+    // bottom, and together all of it.
+    const wide = try Look.tile(&world, .init(5.5, 0), .box(0.5, 0.25));
+    const under_left = try Look.tile(&world, .init(5.25, 0.5), box);
+    _ = try Look.tile(&world, .init(5.75, 0.5), box);
+    try testing.expectEqual(@as(collide.Hidden, 0b0100), Look.hidden(&world, wide));
+    try testing.expectEqual(@as(collide.Hidden, 0b0011), Look.hidden(&world, under_left));
+
+    // Three millimetres apart, as a level placed by hand comes out, is
+    // joined; a centimetre apart is a gap, with a face on each side of it.
+    const close = try Look.tile(&world, .init(10, 0), box);
+    _ = try Look.tile(&world, .init(10.503, 0), box);
+    try testing.expectEqual(@as(collide.Hidden, 0b0010), Look.hidden(&world, close));
+    const apart = try Look.tile(&world, .init(20, 0), box);
+    _ = try Look.tile(&world, .init(20.51, 0), box);
+    try testing.expectEqual(@as(collide.Hidden, 0), Look.hidden(&world, apart));
+
+    // Something may pass through a piece with another filter, or a sensor,
+    // and stop at this one: neither covers it.
+    const beside_other = try Look.tile(&world, .init(30, 0), box);
+    _ = try Look.tile(&world, .init(30.5, 0), .{ .geometry = box.geometry, .filter = .{ .category = 2 } });
+    try testing.expectEqual(@as(collide.Hidden, 0), Look.hidden(&world, beside_other));
+    const beside_sensor = try Look.tile(&world, .init(40, 0), box);
+    _ = try Look.tile(&world, .init(40.5, 0), .{ .geometry = box.geometry, .sensor = true });
+    try testing.expectEqual(@as(collide.Hidden, 0), Look.hidden(&world, beside_sensor));
+
+    // Taking a tile away shows what it covered: the middle tile's right side
+    // is to be worked out again, and is open.
+    world.destroyBody(world.shape(grid[2][1]).?.body);
+    try testing.expect(!world.shape(grid[1][1]).?.hidden_known);
+    try testing.expectEqual(@as(collide.Hidden, 0b1101), Look.hidden(&world, grid[1][1]));
+
+    // Moving one by hand shows what it covered where it was.
+    world.bodyAt(world.shape(grid[0][1]).?.body_index).setTransform(.init(-3, 0), 0);
+    try world.refitMovedLevel();
+    world.moved_level.clearRetainingCapacity();
+    try testing.expect(!world.shape(grid[1][1]).?.hidden_known);
+    try testing.expectEqual(@as(collide.Hidden, 0b0101), Look.hidden(&world, grid[1][1]));
+}
 
 test "a body's mass comes from its shapes, and is one when they weigh nothing" {
     var world: World = .init(testing.allocator, .{});
