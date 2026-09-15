@@ -402,6 +402,34 @@ test "an area set down on a sleeping body sees it, and leaves it asleep" {
     }
 }
 
+test "a hitbox that asks for nothing is seen by the hurtbox that asks for it" {
+    for (modes) |mode| {
+        var jobs: Jobs = try .init(gpa, mode);
+        defer jobs.deinit();
+        var world: World = .init(gpa, .{ .gravity = .zero });
+        defer world.deinit();
+
+        const hitboxes: u16 = 2;
+        const sword = try world.createBody(.{ .type = .kinematic, .position = .init(0, 0) });
+        const hitbox = try world.addShape(sword, .{ .geometry = .{ .polygon = .box(0.5, 0.5) }, .sensor = true, .filter = .{ .category = hitboxes, .mask = 0 } });
+        const enemy = try world.createBody(.{ .type = .kinematic, .position = .init(0.5, 0) });
+        _ = try world.addShape(enemy, .{ .geometry = .{ .polygon = .box(0.5, 0.5) }, .sensor = true, .filter = .{ .category = 0, .mask = hitboxes } });
+
+        try world.step(dt, &jobs);
+        try testing.expectEqual(@as(usize, 1), sensorEvents(&world, hitbox)[0]);
+
+        // Two crates with the same bits and no sensor pass through each
+        // other: a push takes both sides asking.
+        const a = try world.createBody(.{ .position = .init(10, 0), .linear_velocity = .init(1, 0) });
+        _ = try world.addShape(a, .{ .geometry = .{ .polygon = .box(0.5, 0.5) }, .filter = .{ .category = hitboxes, .mask = 0 } });
+        const b = try world.createBody(.{ .position = .init(11.5, 0) });
+        _ = try world.addShape(b, .{ .geometry = .{ .polygon = .box(0.5, 0.5) }, .filter = .{ .category = 0, .mask = hitboxes } });
+        try steps(&world, &jobs, 60);
+        try testing.expect(world.body(a).?.position().x > 10.9);
+        try testing.expectApproxEqAbs(@as(f32, 11.5), world.body(b).?.position().x, 1e-4);
+    }
+}
+
 test "two things that cannot move still never touch without a sensor" {
     for (modes) |mode| {
         var jobs: Jobs = try .init(gpa, mode);

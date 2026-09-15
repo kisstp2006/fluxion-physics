@@ -1231,8 +1231,12 @@ fn mayTouch(world: *World, ea: *const ShapeEntry, eb: *const ShapeEntry, ba: *co
     // Two things that cannot move have nothing to say to each other - unless
     // one of them is a sensor, which is there to say what it is over: a
     // trigger a kinematic character walks into, an area over the level.
-    if (ba.type != .dynamic and bb.type != .dynamic and !ea.def.sensor and !eb.def.sensor) return false;
-    if (!ea.def.filter.shouldCollide(eb.def.filter)) return false;
+    const sensing = ea.def.sensor or eb.def.sensor;
+    if (ba.type != .dynamic and bb.type != .dynamic and !sensing) return false;
+    // A sensor is seen when either side asks for the other - a hitbox by the
+    // hurtbox that watches for it - and a push takes both.
+    const filtered = if (sensing) ea.def.filter.shouldSense(eb.def.filter) else ea.def.filter.shouldCollide(eb.def.filter);
+    if (!filtered) return false;
     // Nor do two a joint holds, unless it says they should.
     if (world.no_collide.count() != 0 and world.no_collide.contains(bodyPairKey(ea.body_index, eb.body_index))) return false;
     return true;

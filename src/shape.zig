@@ -327,7 +327,31 @@ pub const Filter = struct {
         if (a.group == b.group and a.group != 0) return a.group > 0;
         return (a.mask & b.category) != 0 and (a.category & b.mask) != 0;
     }
+
+    /// Whether a sensor and another shape see each other: one side's mask
+    /// having the other's category is enough, so a hitbox that asks for
+    /// nothing is still seen by the hurtbox that asks for hitboxes. Groups
+    /// as in `shouldCollide`. Which of the two cares is the caller's to say,
+    /// by its own mask.
+    pub fn shouldSense(a: Filter, b: Filter) bool {
+        if (a.group == b.group and a.group != 0) return a.group > 0;
+        return (a.mask & b.category) != 0 or (a.category & b.mask) != 0;
+    }
 };
+
+test "a sensor's pair needs one side to ask for the other, a collision both" {
+    const hitbox: Filter = .{ .category = 2, .mask = 0 };
+    const hurtbox: Filter = .{ .category = 0, .mask = 2 };
+    try std.testing.expect(hitbox.shouldSense(hurtbox) and hurtbox.shouldSense(hitbox));
+    try std.testing.expect(!hitbox.shouldCollide(hurtbox));
+
+    const blind: Filter = .{ .category = 4, .mask = 0 };
+    try std.testing.expect(!hitbox.shouldSense(blind));
+
+    // A negative group still keeps its own apart, whatever the bits ask.
+    const a: Filter = .{ .category = 1, .mask = 1, .group = -3 };
+    try std.testing.expect(!a.shouldSense(a));
+}
 
 /// A shape as a game describes it: geometry, surface, and who it touches.
 /// What `World.addShape` takes and keeps.
