@@ -56,8 +56,8 @@ pointer.
 
 **Three kinds of body.** Static never moves and holds everything up.
 Kinematic moves the way it is told and is pushed by nothing. Dynamic is what
-physics is for. Only dynamic bodies collide with each other, and a kinematic
-platform carries what stands on it.
+physics is for. Only dynamic bodies collide with each other - a sensor sees
+the rest too - and a kinematic platform carries what stands on it.
 
 **Two geometries, on purpose.** A circle and a convex polygon of up to eight
 corners. `Polygon.fromPoints` takes corners in any order and hands back the
@@ -315,7 +315,10 @@ allocator and arithmetic.
 - **Events**: `world.beginEvents()` and `world.endEvents()` list every pair
   of shapes that started or stopped touching during the last step, including
   because one was destroyed. A **sensor** shape appears in them and pushes
-  nothing: a trigger volume, a pickup radius. A sleeping contact is still
+  nothing: a trigger volume, a pickup radius. It sees every kind of body -
+  a kinematic character walking into a trigger, the level under an area on
+  a kinematic body, another sensor - and goes on seeing what stands still in
+  it; only two static shapes never meet. A sleeping contact is still
   touching, and ends nothing.
 - **Queries**, between steps: `castRay` for the first thing along a line,
   `overlapPoint` for what is under the mouse, `overlapAabb` for everything in

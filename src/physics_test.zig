@@ -292,6 +292,136 @@ test "filters keep shapes apart and sensors report without pushing" {
     }
 }
 
+/// The sensor events for `shape` this step: begun and ended.
+fn sensorEvents(world: *const World, shape: physics.ShapeId) [2]usize {
+    var got: [2]usize = .{ 0, 0 };
+    for (world.beginEvents()) |e| {
+        if (e.sensor and (e.shape_a.eql(shape) or e.shape_b.eql(shape))) got[0] += 1;
+    }
+    for (world.endEvents()) |e| {
+        if (e.sensor and (e.shape_a.eql(shape) or e.shape_b.eql(shape))) got[1] += 1;
+    }
+    return got;
+}
+
+test "a trigger sees a kinematic body walk in, stand in it, and walk out" {
+    for (modes) |mode| {
+        var jobs: Jobs = try .init(gpa, mode);
+        defer jobs.deinit();
+        var world: World = .init(gpa, .{});
+        defer world.deinit();
+
+        const trigger = try world.createBody(.{ .type = .static, .position = .init(0, 0) });
+        const zone = try world.addShape(trigger, .{ .geometry = .{ .polygon = .box(1, 1) }, .sensor = true });
+        const walker = try world.createBody(.{ .type = .kinematic, .position = .init(-3, 0), .linear_velocity = .init(3, 0) });
+        _ = try world.addShape(walker, .box(0.25, 0.25));
+
+        var begun: usize = 0;
+        var ended: usize = 0;
+        for (0..40) |_| {
+            try world.step(dt, &jobs);
+            const got = sensorEvents(&world, zone);
+            begun += got[0];
+            ended += got[1];
+        }
+        try testing.expectEqual(@as(usize, 1), begun);
+        try testing.expectEqual(@as(usize, 0), ended);
+
+        // Standing still in it: still in it, every step.
+        world.body(walker).?.linear_velocity = .zero;
+        for (0..60) |_| {
+            try world.step(dt, &jobs);
+            const got = sensorEvents(&world, zone);
+            begun += got[0];
+            ended += got[1];
+        }
+        try testing.expectEqual(@as(usize, 1), begun);
+        try testing.expectEqual(@as(usize, 0), ended);
+        try testing.expectEqual(@as(usize, 1), world.touchingCount());
+
+        // And out the other side.
+        world.body(walker).?.linear_velocity = .init(3, 0);
+        for (0..60) |_| {
+            try world.step(dt, &jobs);
+            ended += sensorEvents(&world, zone)[1];
+        }
+        try testing.expectEqual(@as(usize, 1), ended);
+    }
+}
+
+test "a sensor on a body that does not move sees the level, and an area another area" {
+    for (modes) |mode| {
+        var jobs: Jobs = try .init(gpa, mode);
+        defer jobs.deinit();
+        var scene = try floored();
+        var world = &scene.world;
+        defer world.deinit();
+
+        // An area set down on the floor, going nowhere.
+        const area = try world.createBody(.{ .type = .kinematic, .position = .init(0, 0) });
+        const watcher = try world.addShape(area, .{ .geometry = .{ .polygon = .box(1, 0.5) }, .sensor = true });
+        // And another beside it, overlapping it.
+        const other = try world.createBody(.{ .type = .kinematic, .position = .init(1.5, 0) });
+        _ = try world.addShape(other, .{ .geometry = .{ .polygon = .box(1, 0.5) }, .sensor = true });
+
+        try world.step(dt, &jobs);
+        try testing.expectEqual(@as(usize, 2), sensorEvents(world, watcher)[0]);
+        var ended: usize = 0;
+        for (0..60) |_| {
+            try world.step(dt, &jobs);
+            ended += sensorEvents(world, watcher)[1];
+        }
+        try testing.expectEqual(@as(usize, 0), ended);
+        // The floor with each area, and the areas with each other.
+        try testing.expectEqual(@as(usize, 3), world.touchingCount());
+    }
+}
+
+test "an area set down on a sleeping body sees it, and leaves it asleep" {
+    for (modes) |mode| {
+        var jobs: Jobs = try .init(gpa, mode);
+        defer jobs.deinit();
+        var scene = try floored();
+        var world = &scene.world;
+        defer world.deinit();
+
+        const crate = try world.createBody(.{ .position = .init(0, -0.5) });
+        _ = try world.addShape(crate, .box(0.5, 0.5));
+        try steps(world, &jobs, 120);
+        try testing.expect(!world.body(crate).?.isAwake());
+
+        // Far away first, then put down on the crate by hand.
+        const area = try world.createBody(.{ .type = .kinematic, .position = .init(-20, -10) });
+        const watcher = try world.addShape(area, .{ .geometry = .{ .polygon = .box(1, 1) }, .sensor = true });
+        try world.step(dt, &jobs);
+        world.body(area).?.setTransform(.init(0, -0.5), 0);
+        try world.step(dt, &jobs);
+
+        try testing.expect(sensorEvents(world, watcher)[0] >= 1);
+        try testing.expect(!world.body(crate).?.isAwake());
+    }
+}
+
+test "two things that cannot move still never touch without a sensor" {
+    for (modes) |mode| {
+        var jobs: Jobs = try .init(gpa, mode);
+        defer jobs.deinit();
+        var scene = try floored();
+        var world = &scene.world;
+        defer world.deinit();
+
+        // A kinematic block through the floor, and another through it.
+        const block = try world.createBody(.{ .type = .kinematic, .position = .init(0, 0.25) });
+        _ = try world.addShape(block, .box(1, 1));
+        const beside = try world.createBody(.{ .type = .kinematic, .position = .init(0.5, 0.25), .linear_velocity = .init(0.1, 0) });
+        _ = try world.addShape(beside, .box(1, 1));
+
+        try steps(world, &jobs, 10);
+        try testing.expectEqual(@as(usize, 0), world.touchingCount());
+        try testing.expectApproxEqAbs(@as(f32, 0.25), world.body(block).?.position().y, 1e-6);
+    }
+}
+
 test "a kinematic platform carries what stands on it" {
     for (modes) |mode| {
         var jobs: Jobs = try .init(gpa, mode);

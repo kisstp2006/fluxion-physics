@@ -1158,8 +1158,9 @@ fn forgetCoverNear(self: *World, box: Aabb) void {
 
 /// Every pair of a moving shape and a piece of the level whose boxes
 /// overlap, into `pairs`, after the sweep's. Each dynamic shape that is
-/// awake asks the tree about its own box: a sleeper keeps what it had, and
-/// a kinematic body has nothing to say to a wall.
+/// awake asks the tree about its own box, and so does every kinematic one,
+/// moving or not: a kinematic body has nothing to say to a wall, but a
+/// sensor on either side has - see `mayTouch`. A sleeper keeps what it had.
 ///
 /// In the sweep's order and then the tree's, both of which depend only on
 /// what was added and where, so the pairs - and the step - come out the
@@ -1170,7 +1171,12 @@ fn findLevelPairs(self: *World) Error!void {
     for (self.sweep.order.items) |index| {
         const entry = &self.shapes.slots.items[index].value.?;
         const b = self.bodyAt(entry.body_index);
-        if (b.type != .dynamic or !b.awake) continue;
+        const asks = switch (b.type) {
+            .dynamic => b.awake,
+            .kinematic => true,
+            .static => false,
+        };
+        if (!asks) continue;
         visitor.shape = index;
         self.static_tree.query(self.aabbs.items[index], &visitor, LevelVisitor.visit);
         if (visitor.failed) return error.OutOfMemory;
@@ -1204,16 +1210,28 @@ fn acceptPair(world: *World, a: u32, b: u32) bool {
     const ba = world.bodyAt(ea.body_index);
     const bb = world.bodyAt(eb.body_index);
     // Two sleepers, or a sleeper and a wall, keep whatever they had; see
-    // `prepareContacts`.
-    if (!isActive(ba) and !isActive(bb)) return false;
+    // `prepareContacts`. A sensor's pair is looked at whether anything in it
+    // moves or not, unless both bodies sleep: nothing else would keep it.
+    if (!isActive(ba) and !isActive(bb) and !watched(ea, eb, ba, bb)) return false;
     return world.mayTouch(ea, eb, ba, bb);
+}
+
+/// Whether a pair is a sensor's to watch every step, still or not: a sensor
+/// in it, and a body that is not dynamic - a trigger a character stands in,
+/// an area set down over a wall or on a body that sleeps. Two dynamic
+/// sleepers keep their contact asleep instead.
+fn watched(ea: *const ShapeEntry, eb: *const ShapeEntry, ba: *const Body, bb: *const Body) bool {
+    if (!ea.def.sensor and !eb.def.sensor) return false;
+    return ba.type != .dynamic or bb.type != .dynamic;
 }
 
 /// Whether two shapes may touch at all, whatever they are doing.
 fn mayTouch(world: *World, ea: *const ShapeEntry, eb: *const ShapeEntry, ba: *const Body, bb: *const Body) bool {
     if (ea.body_index == eb.body_index) return false;
-    // Two things that cannot move have nothing to say to each other.
-    if (ba.type != .dynamic and bb.type != .dynamic) return false;
+    // Two things that cannot move have nothing to say to each other - unless
+    // one of them is a sensor, which is there to say what it is over: a
+    // trigger a kinematic character walks into, an area over the level.
+    if (ba.type != .dynamic and bb.type != .dynamic and !ea.def.sensor and !eb.def.sensor) return false;
     if (!ea.def.filter.shouldCollide(eb.def.filter)) return false;
     // Nor do two a joint holds, unless it says they should.
     if (world.no_collide.count() != 0 and world.no_collide.contains(bodyPairKey(ea.body_index, eb.body_index))) return false;
@@ -1306,15 +1324,17 @@ fn prepareContacts(self: *World, ctx: Step) Error!void {
 
     // What was touching and is asleep - neither body moving this step -
     // stays touching, impulses and all, without being looked at: that is
-    // most of what sleeping saves. It cannot also have been found above,
-    // because a pair with nothing active in it is never accepted. Every
-    // contact has a dynamic body in it, so with none asleep there is
-    // nothing to keep and the walk is skipped.
+    // most of what sleeping saves. A sensor's pair may have been looked at
+    // above all the same, and then what was found stands; see `watched`.
+    // A contact with no dynamic body in it is a sensor's, looked at every
+    // step, so with no dynamic body asleep there is nothing to keep and the
+    // walk is skipped.
     if (!self.anyAsleep()) return;
     var then = self.previous.iterator();
     while (then.next()) |entry| {
         const stored = entry.value_ptr;
         if (!self.keepsSleeping(stored)) continue;
+        if (self.contacts.contains(entry.key_ptr.*)) continue;
         try self.contacts.put(gpa, entry.key_ptr.*, stored.*);
         if (stored.sensor) continue;
         try self.links.append(gpa, .{
