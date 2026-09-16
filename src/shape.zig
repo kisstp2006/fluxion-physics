@@ -299,30 +299,67 @@ pub const Geometry = union(enum) {
 
 /// How a surface behaves when touched.
 pub const Material = struct {
-    /// Coulomb friction. Two surfaces' values are combined by geometric
-    /// mean, so ice against anything is slippery.
+    /// Coulomb friction. Two surfaces' values make the pair's as
+    /// `Settings.friction_mix` says: by default their geometric mean, so ice
+    /// against anything is slippery.
     friction: f32 = 0.6,
     /// How much of the approach speed comes back. Zero is a beanbag, one a
-    /// superball; the pair's larger value wins.
+    /// superball. The pair's is `Settings.restitution_mix` of the two: by
+    /// default the larger.
     restitution: f32 = 0,
     /// Mass per unit area. Zero is allowed and weighs nothing; a body all of
     /// whose shapes weigh nothing gets a mass of one so it can still move.
     density: f32 = 1,
 };
 
-/// Who touches whom. Sixteen categories and a group, which is Box2D's
-/// scheme and enough for every game that has used it.
+/// How two surfaces' values make the one their contact uses. Box2D's are
+/// the geometric mean for friction and the larger for restitution; Godot
+/// 3's the smaller for friction and the sum, up to one, for bounce.
+pub const Mix = enum {
+    /// sqrt(a b): ice against anything is slippery, rubber on rubber grips.
+    geometric_mean,
+    /// The smaller.
+    minimum,
+    /// The larger: a superball bounces off anything.
+    maximum,
+    /// The two added, and no more than one: two half-bouncy things bounce
+    /// all the way.
+    sum_clamped,
+
+    pub fn of(mix: Mix, a: f32, b: f32) f32 {
+        return switch (mix) {
+            .geometric_mean => @sqrt(a * b),
+            .minimum => @min(a, b),
+            .maximum => @max(a, b),
+            .sum_clamped => std.math.clamp(a + b, 0, 1),
+        };
+    }
+};
+
+test "each mix makes the pair's value its way" {
+    try testing.expectApproxEqAbs(@as(f32, 0.4), Mix.geometric_mean.of(0.2, 0.8), 1e-6);
+    try testing.expectEqual(@as(f32, 0.2), Mix.minimum.of(0.2, 0.8));
+    try testing.expectEqual(@as(f32, 0.8), Mix.maximum.of(0.8, 0.2));
+    try testing.expectApproxEqAbs(@as(f32, 0.7), Mix.sum_clamped.of(0.3, 0.4), 1e-6);
+    try testing.expectEqual(@as(f32, 1), Mix.sum_clamped.of(0.6, 0.7));
+}
+
+/// Who touches whom. Thirty-two categories and a group, which is Box2D's
+/// scheme with Godot's number of layers.
 pub const Filter = struct {
     /// What this shape is. One bit, usually.
-    category: u16 = 1,
+    category: u32 = 1,
     /// What this shape touches. Every bit, usually.
-    mask: u16 = 0xFFFF,
+    mask: u32 = 0xFFFF_FFFF,
     /// Shapes in the same positive group always touch; in the same negative
     /// group never do; zero is no group. Overrides the bits, which is what
     /// makes it worth having: the pieces of one ragdoll never touch each
     /// other, whatever their categories say.
     group: i16 = 0,
 
+    /// Whether two shapes that push may touch: each one's mask has the
+    /// other's category - or with `Settings.filter_rule = .either`, one of
+    /// them does, which is `shouldSense`.
     pub fn shouldCollide(a: Filter, b: Filter) bool {
         if (a.group == b.group and a.group != 0) return a.group > 0;
         return (a.mask & b.category) != 0 and (a.category & b.mask) != 0;
@@ -353,6 +390,40 @@ test "a sensor's pair needs one side to ask for the other, a collision both" {
     try std.testing.expect(!a.shouldSense(a));
 }
 
+/// Which filter rule the world keeps for shapes that push. See
+/// `Settings.filter_rule`.
+pub const FilterRule = enum {
+    /// Each one's mask has the other's category: Box2D's.
+    both,
+    /// One of them does: Godot 3's, where a body's mask says what it
+    /// scans, and being scanned is enough.
+    either,
+};
+
+test "a category in the thirty-second bit filters like the first" {
+    const top: Filter = .{ .category = 1 << 31, .mask = 1 << 31 };
+    const first: Filter = .{ .category = 1, .mask = 1 };
+    try testing.expect(top.shouldCollide(top));
+    try testing.expect(!top.shouldCollide(first));
+    // Only the first asks for the top bit: enough for `.either`.
+    const asks: Filter = .{ .category = 1, .mask = 1 << 31 };
+    try testing.expect(!asks.shouldCollide(.{ .category = 1 << 31, .mask = 0 }));
+    try testing.expect(asks.shouldSense(.{ .category = 1 << 31, .mask = 0 }));
+}
+
+/// A platform that holds what lands on it from one side and lets through
+/// what comes from any other: Godot 3's one-way collision. Decided when the
+/// two first touch, and kept while they stay touching - so a body jumping
+/// up through a floor is let through all the way, and one standing on it
+/// is held however the solver jitters it.
+pub const OneWay = struct {
+    /// The way something is held, in the frame of the body the shape is on:
+    /// `+y`, down this screen, for a floor to stand on. A first touch holds
+    /// when the contact's normal says the other shape is on the side this
+    /// arrow comes from - above a floor.
+    direction: Vec2 = .init(0, 1),
+};
+
 /// A shape as a game describes it: geometry, surface, and who it touches.
 /// What `World.addShape` takes and keeps.
 pub const Shape = struct {
@@ -362,6 +433,9 @@ pub const Shape = struct {
     /// A sensor reports what overlaps it and pushes nothing. A trigger
     /// volume, a pickup radius, the bottom of a pit.
     sensor: bool = false,
+    /// Held from one side only: a platform to jump up through. Null holds
+    /// from every side. A sensor pushes nothing, so it has no side.
+    one_way: ?OneWay = null,
     /// Yours. A shape never reads it.
     user_data: u64 = 0,
 

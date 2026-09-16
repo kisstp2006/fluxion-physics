@@ -76,6 +76,9 @@ pub const Circle = shape.Circle;
 pub const Polygon = shape.Polygon;
 pub const Material = shape.Material;
 pub const Filter = shape.Filter;
+pub const FilterRule = shape.FilterRule;
+pub const Mix = shape.Mix;
+pub const OneWay = shape.OneWay;
 
 /// What names a joint. See `World.createJoint`.
 pub const JointId = joint.Id;

@@ -327,12 +327,45 @@ allocator and arithmetic.
 
 ## Filtering
 
-Sixteen category bits, a mask, and a group, which is Box2D's scheme:
+Thirty-two category bits, a mask, and a group: Box2D's scheme, with Godot's
+number of layers.
 
 ```zig
 const player: physics.Filter = .{ .category = 0b01, .mask = 0b10 };  // touches only category 2
 const ragdoll_part: physics.Filter = .{ .group = -7 };               // never touches its own group
 ```
+
+- **Two shapes that push need each one's mask to have the other's category.**
+  With `Settings.filter_rule = .either`, Godot 3's rule, one of them is
+  enough. A sensor is always seen when either side asks.
+- **Two bodies can be kept apart whatever their bits say**:
+  `world.addCollisionException(a, b)`, Godot's collision exception. It is
+  counted, and goes when either body is destroyed.
+
+## One-way platforms
+
+A shape with `.one_way = .{}` holds what lands on it from above and lets
+through what comes up from below or in from the side: a platform to jump up
+through.
+
+- **Decided at the first touch, from the side the contact is on**, and kept
+  while the two go on touching. A body jumping up through is let through all
+  the way, even past the middle, and a body standing on the platform is held
+  however the solver nudges it.
+- **The arrow turns with the body**, or points elsewhere: `.direction`, in the
+  body's frame, is the way something is held going.
+- **The sweep for fast bodies knows the rule too.** It stops a fast body
+  coming down onto a thin platform, and not one going up through it.
+
+## Surfaces
+
+Friction and restitution are per shape. A contact makes its own from its two
+shapes' as `Settings.friction_mix` and `Settings.restitution_mix` say:
+
+| Setting | Default (Box2D) | Godot 3 |
+|---|---|---|
+| `friction_mix` | `.geometric_mean`: ice on anything is slippery | `.minimum` |
+| `restitution_mix` | `.maximum`: a superball bounces off anything | `.sum_clamped` |
 
 ## What is not here
 

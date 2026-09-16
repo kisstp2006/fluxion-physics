@@ -555,3 +555,350 @@ test "a step with nothing in it, and a step of no time, do nothing" {
     try testing.expect(world.body(b).?.position().eql(.zero));
     try testing.expectEqual(@as(u64, 1), world.step_count);
 }
+
+// -------------------------------------------------------------------------
+// Godot's rules: which bits touch, exceptions, one-way floors, mixing
+// -------------------------------------------------------------------------
+
+test "with Godot's filter rule one mask asking is enough to touch, with Box2D's it takes both" {
+    for ([_]physics.FilterRule{ .both, .either }) |rule| {
+        var jobs: Jobs = try .init(gpa, .{ .io = null });
+        defer jobs.deinit();
+        var world: World = .init(gpa, .{ .filter_rule = rule });
+        defer world.deinit();
+        // A floor that asks for nothing, and a ball in the top category that
+        // asks for the floor.
+        const floor = try world.createBody(.{ .type = .static, .position = .init(0, 0.5) });
+        _ = try world.addShape(floor, .{ .geometry = .{ .polygon = .box(5, 0.5) }, .filter = .{ .category = 1, .mask = 0 } });
+        const ball = try world.createBody(.{ .position = .init(0, -1) });
+        _ = try world.addShape(ball, .{ .geometry = .{ .circle = .{ .radius = 0.25 } }, .filter = .{ .category = 1 << 31, .mask = 1 } });
+        try steps(&world, &jobs, 120);
+        const y = world.body(ball).?.position().y;
+        switch (rule) {
+            .both => try testing.expect(y > 5),
+            .either => try testing.expectApproxEqAbs(@as(f32, -0.25), y, 0.02),
+        }
+    }
+}
+
+test "a collision exception lets a body through the floor until the last one is taken back" {
+    for (modes) |mode| {
+        var jobs: Jobs = try .init(gpa, mode);
+        defer jobs.deinit();
+        var scene = try floored();
+        var world = &scene.world;
+        defer world.deinit();
+
+        // Told twice, taken back once: still kept apart.
+        const ghost = try world.createBody(.{ .position = .init(-2, -1) });
+        _ = try world.addShape(ghost, .circle(0.25));
+        try world.addCollisionException(ghost, scene.floor);
+        try world.addCollisionException(scene.floor, ghost);
+        world.removeCollisionException(ghost, scene.floor);
+        try testing.expect(world.hasCollisionException(scene.floor, ghost));
+        try testing.expectError(error.SameBody, world.addCollisionException(ghost, ghost));
+
+        // Told once and taken back: lands.
+        const lands = try world.createBody(.{ .position = .init(2, -1) });
+        _ = try world.addShape(lands, .circle(0.25));
+        try world.addCollisionException(lands, scene.floor);
+        world.removeCollisionException(lands, scene.floor);
+        try testing.expect(!world.hasCollisionException(lands, scene.floor));
+
+        try steps(world, &jobs, 120);
+        try testing.expect(world.body(ghost).?.position().y > 5);
+        try testing.expectApproxEqAbs(@as(f32, -0.25), world.body(lands).?.position().y, 0.02);
+
+        // At rest on the floor, asleep by now, and then told: it falls.
+        try world.addCollisionException(lands, scene.floor);
+        try steps(world, &jobs, 60);
+        try testing.expect(world.body(lands).?.position().y > 1);
+
+        // A body made in the slot of a destroyed one has none of its
+        // exceptions.
+        world.destroyBody(ghost);
+        const heir = try world.createBody(.{ .position = .init(-2, -1) });
+        try testing.expectEqual(ghost.index, heir.index);
+        _ = try world.addShape(heir, .circle(0.25));
+        try testing.expect(!world.hasCollisionException(heir, scene.floor));
+        try steps(world, &jobs, 120);
+        try testing.expectApproxEqAbs(@as(f32, -0.25), world.body(heir).?.position().y, 0.02);
+    }
+}
+
+/// A floor at y = 0, ten metres wide and a metre thick, that holds only what
+/// comes down onto it.
+fn oneWayFloored(half_thickness: f32) !struct { world: World, floor: physics.BodyId } {
+    var world: World = .init(gpa, .{});
+    errdefer world.deinit();
+    const floor = try world.createBody(.{ .type = .static, .position = .init(0, half_thickness) });
+    _ = try world.addShape(floor, .{ .geometry = .{ .polygon = .box(5, half_thickness) }, .one_way = .{} });
+    return .{ .world = world, .floor = floor };
+}
+
+test "a one-way floor holds what lands on it and lets through what comes up from below" {
+    for (modes) |mode| {
+        var jobs: Jobs = try .init(gpa, mode);
+        defer jobs.deinit();
+        var scene = try oneWayFloored(0.5);
+        var world = &scene.world;
+        defer world.deinit();
+
+        const lands = try world.createBody(.{ .position = .init(-2, -2) });
+        _ = try world.addShape(lands, .circle(0.25));
+        // Under the floor, thrown up hard enough to clear it by five metres.
+        const jumps = try world.createBody(.{ .position = .init(2, 2), .linear_velocity = .init(0, -12) });
+        _ = try world.addShape(jumps, .circle(0.25));
+
+        var cleared = false;
+        for (0..300) |_| {
+            try world.step(dt, &jobs);
+            if (world.body(jumps).?.position().y < -1) cleared = true;
+        }
+        try testing.expect(cleared);
+        // Both on top: the one that came up through landed coming down.
+        try testing.expectApproxEqAbs(@as(f32, -0.25), world.body(lands).?.position().y, 0.02);
+        try testing.expectApproxEqAbs(@as(f32, -0.25), world.body(jumps).?.position().y, 0.02);
+
+        // And it stays: ten seconds of the solver's nudges do not let it
+        // through.
+        try steps(world, &jobs, 600);
+        try testing.expectApproxEqAbs(@as(f32, -0.25), world.body(lands).?.position().y, 0.02);
+    }
+}
+
+test "a one-way floor lets through what comes in from its side" {
+    for (modes) |mode| {
+        var jobs: Jobs = try .init(gpa, mode);
+        defer jobs.deinit();
+        var world: World = .init(gpa, .{ .gravity = .zero });
+        defer world.deinit();
+        const floor = try world.createBody(.{ .type = .static, .position = .init(0, 0) });
+        _ = try world.addShape(floor, .{ .geometry = .{ .polygon = .box(1, 0.5) }, .one_way = .{} });
+        const ball = try world.createBody(.{ .position = .init(-3, 0), .linear_velocity = .init(4, 0) });
+        _ = try world.addShape(ball, .circle(0.25));
+        try steps(&world, &jobs, 120);
+        try testing.expect(world.body(ball).?.position().x > 3);
+    }
+}
+
+test "a one-way wall turned on its side holds from one side only" {
+    for (modes) |mode| {
+        var jobs: Jobs = try .init(gpa, mode);
+        defer jobs.deinit();
+        var world: World = .init(gpa, .{ .gravity = .zero });
+        defer world.deinit();
+        // Turned a quarter: the arrow, +y in its own frame, points to -x in
+        // the world, so it holds what comes from +x going -x.
+        const wall = try world.createBody(.{ .type = .static, .position = .zero, .angle = std.math.pi / 2.0 });
+        _ = try world.addShape(wall, .{ .geometry = .{ .polygon = .box(2, 0.25) }, .one_way = .{} });
+        const from_right = try world.createBody(.{ .position = .init(3, 1), .linear_velocity = .init(-4, 0) });
+        _ = try world.addShape(from_right, .circle(0.25));
+        const from_left = try world.createBody(.{ .position = .init(-3, -1), .linear_velocity = .init(4, 0) });
+        _ = try world.addShape(from_left, .circle(0.25));
+        try steps(&world, &jobs, 120);
+        // Stopped at the wall's right face, at x = 0.25, less its radius.
+        try testing.expect(world.body(from_right).?.position().x > 0.4);
+        try testing.expect(world.body(from_left).?.position().x > 3);
+    }
+}
+
+test "the sweep stops a fast body coming down onto a thin one-way floor, not one going up through" {
+    for (modes) |mode| {
+        var jobs: Jobs = try .init(gpa, mode);
+        defer jobs.deinit();
+        var scene = try oneWayFloored(0.02);
+        var world = &scene.world;
+        defer world.deinit();
+        // Sixty metres a second is a metre a step: through a floor four
+        // centimetres thick in one, without the sweep.
+        const down = try world.createBody(.{ .position = .init(-2, -3), .linear_velocity = .init(0, 60) });
+        _ = try world.addShape(down, .circle(0.1));
+        const up = try world.createBody(.{ .position = .init(2, 3), .linear_velocity = .init(0, -60) });
+        _ = try world.addShape(up, .circle(0.1));
+
+        var up_cleared = false;
+        for (0..12) |_| {
+            try world.step(dt, &jobs);
+            if (world.body(up).?.position().y < -1) up_cleared = true;
+        }
+        try testing.expect(up_cleared);
+        try steps(world, &jobs, 180);
+        try testing.expectApproxEqAbs(@as(f32, -0.1), world.body(down).?.position().y, 0.02);
+    }
+}
+
+test "friction and restitution mix as the world says: Box2D's, or Godot's" {
+    const Mixes = struct { friction: physics.Mix, restitution: physics.Mix };
+    var slid: [2]f32 = undefined;
+    var rose: [2]f32 = undefined;
+    for ([_]Mixes{ .{ .friction = .geometric_mean, .restitution = .maximum }, .{ .friction = .minimum, .restitution = .sum_clamped } }, 0..) |mix, i| {
+        var jobs: Jobs = try .init(gpa, .{ .io = null });
+        defer jobs.deinit();
+        var world: World = .init(gpa, .{ .friction_mix = mix.friction, .restitution_mix = mix.restitution });
+        defer world.deinit();
+        const floor = try world.createBody(.{ .type = .static, .position = .init(0, 0.5) });
+        _ = try world.addShape(floor, .{ .geometry = .{ .polygon = .box(40, 0.5) }, .material = .{ .friction = 1, .restitution = 0.4 } });
+
+        // A box sliding along the floor: sqrt(0.2) of friction stops it
+        // sooner than 0.2.
+        const slider = try world.createBody(.{ .position = .init(-30, -0.5), .linear_velocity = .init(5, 0) });
+        _ = try world.addShape(slider, .{ .geometry = .{ .polygon = .box(0.5, 0.5) }, .material = .{ .friction = 0.2 } });
+        // A ball dropped from three metres: 0.4 of the speed comes back, or
+        // 0.3 + 0.4.
+        const ball = try world.createBody(.{ .position = .init(30, -3), .linear_velocity = .zero });
+        _ = try world.addShape(ball, .{ .geometry = .{ .circle = .{ .radius = 0.25 } }, .material = .{ .restitution = 0.3, .friction = 0 } });
+
+        var hit = false;
+        var highest: f32 = 0;
+        for (0..240) |_| {
+            try world.step(dt, &jobs);
+            const b = world.body(ball).?;
+            if (!hit and b.linear_velocity.y < 0 and b.position().y > -1) hit = true;
+            if (hit and b.linear_velocity.y < 0) highest = @min(highest, b.position().y);
+        }
+        slid[i] = world.body(slider).?.position().x + 30;
+        // Above where it rests, a radius up.
+        rose[i] = -highest - 0.25;
+        try testing.expect(hit);
+    }
+    // 0.2 against sqrt(0.2) of the grip: over twice as far, less what
+    // starting to slide takes.
+    try testing.expect(slid[1] > 1.8 * slid[0]);
+    // 0.7 against 0.4 of the speed back: about three times as high.
+    try testing.expect(rose[1] > 2 * rose[0]);
+}
+
+test "a one-way floor made after what lands on it holds it the same" {
+    for (modes) |mode| {
+        var jobs: Jobs = try .init(gpa, mode);
+        defer jobs.deinit();
+        var world: World = .init(gpa, .{});
+        defer world.deinit();
+        // Made first, so the floor is the second of each pair.
+        const lands = try world.createBody(.{ .position = .init(-2, -2) });
+        _ = try world.addShape(lands, .circle(0.25));
+        const jumps = try world.createBody(.{ .position = .init(2, 2), .linear_velocity = .init(0, -12) });
+        _ = try world.addShape(jumps, .circle(0.25));
+        const floor = try world.createBody(.{ .type = .static, .position = .init(0, 0.5) });
+        _ = try world.addShape(floor, .{ .geometry = .{ .polygon = .box(5, 0.5) }, .one_way = .{} });
+        try steps(&world, &jobs, 300);
+        try testing.expectApproxEqAbs(@as(f32, -0.25), world.body(lands).?.position().y, 0.02);
+        try testing.expectApproxEqAbs(@as(f32, -0.25), world.body(jumps).?.position().y, 0.02);
+    }
+}
+
+test "what a one-way floor decides at the first touch stands until the two part" {
+    for (modes) |mode| {
+        var jobs: Jobs = try .init(gpa, mode);
+        defer jobs.deinit();
+        var world: World = .init(gpa, .{});
+        defer world.deinit();
+        const floor = try world.createBody(.{ .type = .static, .position = .init(0, 0.5) });
+        const floor_shape = try world.addShape(floor, .{ .geometry = .{ .polygon = .box(5, 0.5) }, .one_way = .{} });
+        // Kept awake, so the pair is looked at every step.
+        const held = try world.createBody(.{ .position = .init(-2, -1), .allow_sleep = false });
+        _ = try world.addShape(held, .circle(0.25));
+        try steps(&world, &jobs, 120);
+        try testing.expectApproxEqAbs(@as(f32, -0.25), world.body(held).?.position().y, 0.02);
+
+        // Turned round, the floor holds only what comes up from below. What
+        // stands on it was decided, and stays; what comes down onto it now
+        // goes through.
+        world.shape(floor_shape).?.def.one_way = .{ .direction = .init(0, -1) };
+        const late = try world.createBody(.{ .position = .init(2, -1) });
+        _ = try world.addShape(late, .circle(0.25));
+        try steps(&world, &jobs, 120);
+        try testing.expectApproxEqAbs(@as(f32, -0.25), world.body(held).?.position().y, 0.02);
+        try testing.expect(world.body(late).?.position().y > 3);
+    }
+}
+
+test "a body that rises into a one-way floor past its middle and falls back goes back down through" {
+    for (modes) |mode| {
+        var jobs: Jobs = try .init(gpa, mode);
+        defer jobs.deinit();
+        var scene = try oneWayFloored(0.5);
+        var world = &scene.world;
+        defer world.deinit();
+        // From under the floor, fast enough to rise past its middle, at
+        // y = 0.5, and not out of its top.
+        const ball = try world.createBody(.{ .position = .init(0, 2), .linear_velocity = .init(0, -5.8) });
+        _ = try world.addShape(ball, .circle(0.25));
+        var highest: f32 = 2;
+        for (0..180) |_| {
+            try world.step(dt, &jobs);
+            highest = @min(highest, world.body(ball).?.position().y);
+        }
+        // Past the middle, where the floor's top is nearer and a new touch
+        // would be held;
+        try testing.expect(highest < 0.45);
+        // but it was let in, so it is let out again below.
+        try testing.expect(world.body(ball).?.position().y > 3);
+    }
+}
+
+test "a body let into a one-way block from its side is still let through when it wakes there" {
+    for (modes) |mode| {
+        var jobs: Jobs = try .init(gpa, mode);
+        defer jobs.deinit();
+        var world: World = .init(gpa, .{});
+        defer world.deinit();
+        // A one-way block a metre thick, and a plain ledge along its middle.
+        const block = try world.createBody(.{ .type = .static, .position = .init(0, 0.5) });
+        _ = try world.addShape(block, .{ .geometry = .{ .polygon = .box(1, 0.5) }, .one_way = .{} });
+        const ledge = try world.createBody(.{ .type = .static, .position = .init(0, 0.55) });
+        _ = try world.addShape(ledge, .box(5, 0.05));
+        // A crate on the ledge slides in at the block's side, stops in its top
+        // half, and falls asleep there.
+        const crate = try world.createBody(.{ .position = .init(-1.3, 0.25), .linear_velocity = .init(3, 0) });
+        _ = try world.addShape(crate, .box(0.25, 0.25));
+        try steps(&world, &jobs, 120);
+        try testing.expect(!world.body(crate).?.awake);
+        try testing.expect(world.body(crate).?.position().x > -0.75);
+        try testing.expectApproxEqAbs(@as(f32, 0.25), world.body(crate).?.position().y, 0.02);
+
+        // Woken, it is let through still: the block's top, a new touch would
+        // hold it to, does not lift it out.
+        world.body(crate).?.wake();
+        try steps(&world, &jobs, 60);
+        try testing.expectApproxEqAbs(@as(f32, 0.25), world.body(crate).?.position().y, 0.02);
+    }
+}
+
+test "the sweep lets a fast body through a one-way floor's side, and past one it was let into, without a hitch" {
+    for (modes) |mode| {
+        var jobs: Jobs = try .init(gpa, mode);
+        defer jobs.deinit();
+        var world: World = .init(gpa, .{ .gravity = .zero });
+        defer world.deinit();
+        const thin = try world.createBody(.{ .type = .static, .position = .init(0, 0.1) });
+        _ = try world.addShape(thin, .{ .geometry = .{ .polygon = .box(1, 0.1) }, .one_way = .{} });
+        // Level with the thin floor, going right and a little down: through
+        // its side in one step, and swept, since it moves half a metre a step.
+        const across = try world.createBody(.{ .position = .init(-2, 0.1), .linear_velocity = .init(30, 3) });
+        _ = try world.addShape(across, .circle(0.1));
+
+        // A tall block, and a ball already in at its side, going on down and
+        // across: its centre goes into the block during the step.
+        const tall = try world.createBody(.{ .type = .static, .position = .init(10, 2) });
+        _ = try world.addShape(tall, .{ .geometry = .{ .polygon = .box(1, 2) }, .one_way = .{} });
+        const inside = try world.createBody(.{ .position = .init(8.8, 1), .linear_velocity = .init(12, 24) });
+        _ = try world.addShape(inside, .circle(0.25));
+
+        // A fast one-way plank of its own, level with a plain block and
+        // going right into its side: the block is not on the side the
+        // plank holds from.
+        const block = try world.createBody(.{ .type = .static, .position = .init(0, -5) });
+        _ = try world.addShape(block, .box(1, 0.1));
+        const plank = try world.createBody(.{ .position = .init(-2, -5), .linear_velocity = .init(30, 0) });
+        _ = try world.addShape(plank, .{ .geometry = .{ .polygon = .box(0.1, 0.1) }, .one_way = .{} });
+
+        // Nothing slowed any of them for a moment on the way: a second of
+        // each one's speed, with nothing pulling, to the thousandth.
+        try steps(&world, &jobs, 60);
+        try testing.expectApproxEqAbs(@as(f32, 28), world.body(across).?.position().x, 1e-3);
+        try testing.expectApproxEqAbs(@as(f32, 20.8), world.body(inside).?.position().x, 1e-3);
+        try testing.expectApproxEqAbs(@as(f32, 28), world.body(plank).?.position().x, 1e-3);
+    }
+}

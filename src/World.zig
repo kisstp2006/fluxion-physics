@@ -165,6 +165,14 @@ pub const Settings = struct {
     /// `Body.Def.bullet` for the moving bodies too. Off, a fast ball passes
     /// through a wall thinner than its step. See `continuous`.
     enable_continuous: bool = true,
+    /// Which bits two shapes that push need to touch: both masks having the
+    /// other's category, Box2D's, or either, Godot 3's. A sensor's pair
+    /// always takes either; see `Filter.shouldSense`.
+    filter_rule: shape_mod.FilterRule = .both,
+    /// How a contact's friction and restitution come from its two surfaces'.
+    /// Box2D's by default; Godot 3's are `.minimum` and `.sum_clamped`.
+    friction_mix: shape_mod.Mix = .geometric_mean,
+    restitution_mix: shape_mod.Mix = .maximum,
 };
 
 /// A shape as the world keeps it: the definition, and where it hangs.
@@ -242,6 +250,11 @@ static_tree: Tree = .empty,
 /// there is anything in it; see `bodyPairKey`.
 no_collide: std.AutoHashMapUnmanaged(u64, u32) = .empty,
 
+/// Pairs of bodies told never to touch - Godot's collision exceptions - by
+/// slot, with how many times each was asked. Apart from `no_collide` so a
+/// destroyed body takes its exceptions with it, where a joint goes anyway.
+exceptions: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+
 /// The slots of every body that is not static, in slot order: what the
 /// passes over bodies walk. A level built of a body per tile is thousands
 /// of bodies that never move, and a step that visited each of them a dozen
@@ -276,6 +289,11 @@ inv_h: f32 = 0,
 /// held it there, and the same for the step before. Swapped every step.
 contacts: ContactMap = .empty,
 previous: ContactMap = .empty,
+/// The pairs a one-way shape is letting through, this step and the last,
+/// swapped with `contacts`: overlapping, pushing nothing, reporting
+/// nothing, until they stop overlapping. See `holdsOneWay`.
+one_way_off: ContactMap = .empty,
+one_way_before: ContactMap = .empty,
 begin_events: std.ArrayList(ContactEvent) = .empty,
 end_events: std.ArrayList(ContactEvent) = .empty,
 
@@ -324,6 +342,7 @@ pub fn deinit(self: *World) void {
     self.movers.deinit(gpa);
     self.moved_level.deinit(gpa);
     self.no_collide.deinit(gpa);
+    self.exceptions.deinit(gpa);
     self.aabbs.deinit(gpa);
     self.pairs.deinit(gpa);
     self.manifolds.deinit(gpa);
@@ -336,6 +355,8 @@ pub fn deinit(self: *World) void {
     self.links.deinit(gpa);
     self.contacts.deinit(gpa);
     self.previous.deinit(gpa);
+    self.one_way_off.deinit(gpa);
+    self.one_way_before.deinit(gpa);
     self.begin_events.deinit(gpa);
     self.end_events.deinit(gpa);
     self.* = undefined;
@@ -375,6 +396,15 @@ pub fn destroyBody(self: *World, handle: BodyId) void {
         const j = &(slot.value orelse continue);
         if (j.body_a.eql(handle) or j.body_b.eql(handle)) {
             self.destroyJoint(.{ .index = @intCast(i), .generation = slot.generation });
+        }
+    }
+
+    // Its exceptions go with it, or the next body in its slot would have
+    // them.
+    if (self.exceptions.count() != 0) {
+        var it = self.exceptions.keyIterator();
+        while (it.next()) |key| {
+            if (key.* >> 32 == handle.index or key.* & 0xFFFF_FFFF == handle.index) self.exceptions.removeByPtr(key);
         }
     }
 
@@ -686,6 +716,37 @@ pub fn jointAnchors(self: *World, j: *const Joint) [2]Vec2 {
 pub fn jointReaction(self: *World, handle: JointId) ?joint_mod.Reaction {
     const j = self.joints.getConst(handle) orelse return null;
     return j.reaction(self.inv_h);
+}
+
+/// Keep two bodies from ever touching, whatever their filters say, until
+/// `removeCollisionException`: Godot's `add_collision_exception_with`.
+/// Counted, so two calls take two removals. What they touch now ends at
+/// the next step, and both wake.
+pub fn addCollisionException(self: *World, a: BodyId, b: BodyId) JointError!void {
+    if (self.bodies.getConst(a) == null or self.bodies.getConst(b) == null) return error.NoSuchBody;
+    if (a.eql(b)) return error.SameBody;
+    const entry = try self.exceptions.getOrPut(self.gpa, bodyPairKey(a.index, b.index));
+    entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
+    self.bodyAt(a.index).wake();
+    self.bodyAt(b.index).wake();
+}
+
+/// Take one `addCollisionException` back. The two may touch again once
+/// none is left and nothing else keeps them apart.
+pub fn removeCollisionException(self: *World, a: BodyId, b: BodyId) void {
+    if (self.bodies.getConst(a) == null or self.bodies.getConst(b) == null) return;
+    const key = bodyPairKey(a.index, b.index);
+    const count = self.exceptions.getPtr(key) orelse return;
+    count.* -= 1;
+    if (count.* == 0) _ = self.exceptions.remove(key);
+    self.bodyAt(a.index).wake();
+    self.bodyAt(b.index).wake();
+}
+
+/// Whether an `addCollisionException` keeps the two apart.
+pub fn hasCollisionException(self: *const World, a: BodyId, b: BodyId) bool {
+    if (self.bodies.getConst(a) == null or self.bodies.getConst(b) == null) return false;
+    return self.exceptions.contains(bodyPairKey(a.index, b.index));
 }
 
 /// The key two body slots are known by in `no_collide`, the same whichever
@@ -1234,11 +1295,17 @@ fn mayTouch(world: *World, ea: *const ShapeEntry, eb: *const ShapeEntry, ba: *co
     const sensing = ea.def.sensor or eb.def.sensor;
     if (ba.type != .dynamic and bb.type != .dynamic and !sensing) return false;
     // A sensor is seen when either side asks for the other - a hitbox by the
-    // hurtbox that watches for it - and a push takes both.
-    const filtered = if (sensing) ea.def.filter.shouldSense(eb.def.filter) else ea.def.filter.shouldCollide(eb.def.filter);
+    // hurtbox that watches for it - and a push takes both, or with Godot's
+    // rule either.
+    const either = sensing or world.settings.filter_rule == .either;
+    const filtered = if (either) ea.def.filter.shouldSense(eb.def.filter) else ea.def.filter.shouldCollide(eb.def.filter);
     if (!filtered) return false;
-    // Nor do two a joint holds, unless it says they should.
-    if (world.no_collide.count() != 0 and world.no_collide.contains(bodyPairKey(ea.body_index, eb.body_index))) return false;
+    // Nor do two a joint holds, unless it says they should, or two told
+    // never to.
+    if (world.no_collide.count() != 0 or world.exceptions.count() != 0) {
+        const key = bodyPairKey(ea.body_index, eb.body_index);
+        if (world.no_collide.contains(key) or world.exceptions.contains(key)) return false;
+    }
     return true;
 }
 
@@ -1285,6 +1352,7 @@ fn prepareContacts(self: *World, ctx: Step) Error!void {
     const gpa = self.gpa;
     self.constraints.clearRetainingCapacity();
     self.contacts.clearRetainingCapacity();
+    self.one_way_off.clearRetainingCapacity();
     self.links.clearRetainingCapacity();
 
     for (self.pairs.items, self.manifolds.items) |pair, *m| {
@@ -1297,18 +1365,30 @@ fn prepareContacts(self: *World, ctx: Step) Error!void {
         const handle_b: ShapeId = .{ .index = pair.b, .generation = slot_b.generation };
         const key: contact.PairKey = .{ .a = handle_a.toInt(), .b = handle_b.toInt() };
         const sensor = ea.def.sensor or eb.def.sensor;
-
-        try self.contacts.put(gpa, key, .{
+        const ba = self.bodyAt(ea.body_index);
+        const bb = self.bodyAt(eb.body_index);
+        const stored: Stored = .{
             .shape_a = handle_a,
             .shape_b = handle_b,
             .body_a = ea.body,
             .body_b = eb.body,
             .sensor = sensor,
-        });
+        };
+
+        // A pair with a one-way shape in it is decided when it first
+        // touches, and stays as it was decided while it goes on touching.
+        if (!sensor and (ea.def.one_way != null or eb.def.one_way != null)) {
+            const held = self.previous.contains(key) or
+                (!self.one_way_before.contains(key) and holdsOneWay(m, ea, eb, ba, bb));
+            if (!held) {
+                try self.one_way_off.put(gpa, key, stored);
+                continue;
+            }
+        }
+
+        try self.contacts.put(gpa, key, stored);
         if (sensor) continue;
 
-        const ba = self.bodyAt(ea.body_index);
-        const bb = self.bodyAt(eb.body_index);
         try self.links.append(gpa, .{ .a = ea.body_index, .b = eb.body_index, .type_a = ba.type, .type_b = bb.type });
         const warm: ?[2]contact.Impulse = if (self.previous.get(key)) |last| last.impulses else null;
         try self.constraints.append(gpa, contact.prepare(
@@ -1318,8 +1398,8 @@ fn prepareContacts(self: *World, ctx: Step) Error!void {
             bb,
             ea.body_index,
             eb.body_index,
-            ea.def.material,
-            eb.def.material,
+            self.settings.friction_mix.of(ea.def.material.friction, eb.def.material.friction),
+            self.settings.restitution_mix.of(ea.def.material.restitution, eb.def.material.restitution),
             warm,
             ctx.contact_softness,
             ctx.static_softness,
@@ -1334,6 +1414,14 @@ fn prepareContacts(self: *World, ctx: Step) Error!void {
     // step, so with no dynamic body asleep there is nothing to keep and the
     // walk is skipped.
     if (!self.anyAsleep()) return;
+    // A pair being let through sleeps as it was, too: woken, a body resting
+    // inside a platform it came up through must not be lifted onto it.
+    var off = self.one_way_before.iterator();
+    while (off.next()) |entry| {
+        if (!self.keepsSleeping(entry.value_ptr)) continue;
+        if (self.one_way_off.contains(entry.key_ptr.*)) continue;
+        try self.one_way_off.put(gpa, entry.key_ptr.*, entry.value_ptr.*);
+    }
     var then = self.previous.iterator();
     while (then.next()) |entry| {
         const stored = entry.value_ptr;
@@ -1348,6 +1436,22 @@ fn prepareContacts(self: *World, ctx: Step) Error!void {
             .type_b = self.bodyAt(stored.body_b.index).type,
         });
     }
+}
+
+/// Whether a pair with a one-way shape in it holds, at its first touch:
+/// for each one-way side, the contact's normal says the other shape is on
+/// the side its arrow comes from. Godot 3.6's rule for bodies, which asks
+/// nothing of their speeds or depths. See `shape.OneWay`.
+fn holdsOneWay(m: *const Manifold, ea: *const ShapeEntry, eb: *const ShapeEntry, ba: *const Body, bb: *const Body) bool {
+    const eps = 1e-5;
+    // The manifold's normal is from A to B.
+    if (ea.def.one_way) |way| {
+        if (m.normal.dot(ba.transform.q.rotate(way.direction)) > -eps) return false;
+    }
+    if (eb.def.one_way) |way| {
+        if (m.normal.neg().dot(bb.transform.q.rotate(way.direction)) > -eps) return false;
+    }
+    return true;
 }
 
 /// Whether any dynamic body is asleep. A walk over the bodies that move
@@ -1573,6 +1677,7 @@ fn sweepBody(self: *World, index: u32, b: *Body, ctx: *const Step) void {
     while (self.shapes.get(cursor)) |entry| : (cursor = entry.next) {
         if (entry.def.sensor) continue;
         sweeper.entry = entry;
+        sweeper.entry_handle = cursor;
         // Every pose along the way fits in this: the centre's path, widened
         // by as far as the shape reaches from the centre.
         const reach = entry.def.geometry.reach(b.local_center);
@@ -1589,7 +1694,7 @@ fn sweepBody(self: *World, index: u32, b: *Body, ctx: *const Step) void {
             if (!boxNears(other, box)) continue;
             var other_cursor = other.first_shape;
             while (self.shapes.get(other_cursor)) |other_entry| : (other_cursor = other_entry.next) {
-                sweeper.consider(other_entry);
+                sweeper.consider(other_entry, other_cursor);
             }
         }
     }
@@ -1619,6 +1724,7 @@ const Sweeper = struct {
     body: *const Body,
     path: continuous.Sweep,
     entry: *const ShapeEntry = undefined,
+    entry_handle: ShapeId = undefined,
     /// How far along the earliest first touch that counts is, so far.
     fraction: f32 = 1,
     /// When that touch is one the shape was already pressed into, the way
@@ -1626,16 +1732,19 @@ const Sweeper = struct {
     into: ?Vec2 = null,
 
     fn visitLevel(self: *Sweeper, level_shape: u32) bool {
-        self.consider(&self.world.shapes.slots.items[level_shape].value.?);
+        const slot = &self.world.shapes.slots.items[level_shape];
+        self.consider(&slot.value.?, .{ .index = level_shape, .generation = slot.generation });
         return true;
     }
 
-    fn consider(self: *Sweeper, other: *const ShapeEntry) void {
+    fn consider(self: *Sweeper, other: *const ShapeEntry, other_handle: ShapeId) void {
         if (other.def.sensor) return;
         const world = self.world;
         const ctx = self.ctx;
         const other_body = world.bodyAt(other.body_index);
         if (!world.mayTouch(self.entry, other, self.body, other_body)) return;
+        const one_way = self.entry.def.one_way != null or other.def.one_way != null;
+        if (one_way and self.letThrough(other_handle)) return;
         const g = &self.entry.def.geometry;
         const og = &other.def.geometry;
         const xo = other_body.transform;
@@ -1660,11 +1769,41 @@ const Sweeper = struct {
                     },
                 }
             },
-            .hit => |t| if (self.counts(g, og, xo, t)) {
+            .hit => |t| if (self.counts(g, og, xo, t) and (!one_way or self.holdsAt(t, other, other_body))) {
                 self.fraction = t;
                 self.into = null;
             },
         }
+    }
+
+    /// Whether the step has already let this pair through a one-way shape:
+    /// then it is not swept at all, or a body let in at a platform's side and
+    /// going on through would be stopped by its own centre.
+    fn letThrough(self: *const Sweeper, other_handle: ShapeId) bool {
+        const mine = self.entry_handle;
+        const key: contact.PairKey = if (mine.index < other_handle.index)
+            .{ .a = mine.toInt(), .b = other_handle.toInt() }
+        else
+            .{ .a = other_handle.toInt(), .b = mine.toInt() };
+        return self.world.one_way_off.contains(key);
+    }
+
+    /// Whether a first touch at `t` with a one-way shape in the pair is one
+    /// it holds: the question `holdsOneWay` asks at the step, of which side
+    /// the touch is on. A fast body going up through a floor, or in at its
+    /// side, is not put back.
+    fn holdsAt(self: *const Sweeper, t: f32, other: *const ShapeEntry, other_body: *const Body) bool {
+        const eps = 1e-5;
+        const here = self.path.at(t);
+        // From the fast body's shape towards the other.
+        const normal = continuous.separation(&self.entry.def.geometry, here, &other.def.geometry, other_body.transform).normal;
+        if (other.def.one_way) |way| {
+            if (normal.neg().dot(other_body.transform.q.rotate(way.direction)) > -eps) return false;
+        }
+        if (self.entry.def.one_way) |way| {
+            if (normal.dot(here.q.rotate(way.direction)) > -eps) return false;
+        }
+        return true;
     }
 
     /// The earliest touch is a shape that was already pressed into what it
@@ -1720,6 +1859,7 @@ fn rememberContacts(self: *World) Error!void {
     }
 
     std.mem.swap(ContactMap, &self.contacts, &self.previous);
+    std.mem.swap(ContactMap, &self.one_way_off, &self.one_way_before);
 }
 
 /// Find the islands, and put to sleep every one that has been still for

@@ -48,7 +48,6 @@ const Vec2 = geometry.Vec2;
 const cross = geometry.cross;
 const crossSV = geometry.crossSV;
 const Body = @import("body.zig");
-const shape = @import("shape.zig");
 const collide = @import("collide.zig");
 const Manifold = collide.Manifold;
 const Softness = @import("Softness.zig");
@@ -148,8 +147,10 @@ pub const Block = struct {
 /// cannot be trusted to invert, and only one is kept. Box2D's number.
 const max_condition = 1000;
 
-/// Build the constraint for one manifold. `warm` is what the same pair
-/// ended the last step with, or null if it was not touching then.
+/// Build the constraint for one manifold. `friction` and `restitution` are
+/// the pair's, already made from both surfaces' - see `Settings.friction_mix`.
+/// `warm` is what the same pair ended the last step with, or null if it was
+/// not touching then.
 pub fn prepare(
     key: PairKey,
     manifold: *const Manifold,
@@ -157,8 +158,8 @@ pub fn prepare(
     b: *const Body,
     index_a: u32,
     index_b: u32,
-    material_a: shape.Material,
-    material_b: shape.Material,
+    friction: f32,
+    restitution: f32,
     warm: ?[2]Impulse,
     softness: Softness,
     static_softness: Softness,
@@ -171,9 +172,8 @@ pub fn prepare(
         .body_b = index_b,
         .normal = normal,
         .tangent = tangent,
-        // Ice on anything is slippery; a superball on anything bounces.
-        .friction = @sqrt(material_a.friction * material_b.friction),
-        .restitution = @max(material_a.restitution, material_b.restitution),
+        .friction = friction,
+        .restitution = restitution,
         .inv_mass_a = a.inv_mass,
         .inv_mass_b = b.inv_mass,
         .inv_inertia_a = a.inv_inertia,
@@ -489,8 +489,7 @@ test "a head-on hit with no restitution stops, and with full restitution bounces
 
     for ([_]f32{ 0, 1 }) |e| {
         var mover = ball(1, .init(3, 0));
-        const soft: shape.Material = .{ .restitution = e, .friction = 0 };
-        var c = prepare(.{ .a = 1, .b = 2 }, &m, &wall, &mover, 0, 1, soft, soft, null, rigid, rigid);
+        var c = prepare(.{ .a = 1, .b = 2 }, &m, &wall, &mover, 0, 1, 0, e, null, rigid, rigid);
         for (0..4) |_| solve(&c, &wall, &mover, test_step, .solve);
         // Solving stops it dead; the bounce is its own pass, after.
         try testing.expectApproxEqAbs(@as(f32, 0), mover.linear_velocity.x, 1e-5);
@@ -507,7 +506,7 @@ test "a sunk-in point is pushed out while solving, and the push is taken back re
     var m: Manifold = .{ .normal = .init(0, -1), .count = 1 };
     m.points[0] = .{ .point = .init(0, 0.5), .separation = -0.1, .id = 0 };
     var box = ball(1, .zero);
-    var c = prepare(.{ .a = 1, .b = 2 }, &m, &floor, &box, 0, 1, .{}, .{}, null, rigid, rigid);
+    var c = prepare(.{ .a = 1, .b = 2 }, &m, &floor, &box, 0, 1, 0.6, 0, null, rigid, rigid);
     for (0..4) |_| solve(&c, &floor, &box, test_step, .solve);
     // A fifth of the depth per step: 0.02 over a sixtieth, 1.2 m/s up.
     try testing.expectApproxEqAbs(@as(f32, -1.2), box.linear_velocity.y, 1e-4);
@@ -531,7 +530,7 @@ test "two corners are solved together, and share a load evenly" {
     var m: Manifold = .{ .normal = .init(0, -1), .count = 2 };
     m.points[0] = .{ .point = .init(-0.5, 0.5), .separation = 0, .id = 1 };
     m.points[1] = .{ .point = .init(0.5, 0.5), .separation = 0, .id = 2 };
-    var c = prepare(.{ .a = 1, .b = 2 }, &m, &floor, &box, 0, 1, .{}, .{}, null, rigid, rigid);
+    var c = prepare(.{ .a = 1, .b = 2 }, &m, &floor, &box, 0, 1, 0.6, 0, null, rigid, rigid);
     try testing.expectEqual(@as(u32, 2), c.count);
 
     // One pass is enough: the block gets both corners exactly, where one
@@ -549,8 +548,7 @@ test "friction slows a sliding box and cannot exceed its share of the normal imp
     var m: Manifold = .{ .normal = .init(0, -1), .count = 1 };
     m.points[0] = .{ .point = .init(0, 0.5), .separation = 0, .id = 0 };
 
-    const rough: shape.Material = .{ .friction = 0.5 };
-    var c = prepare(.{ .a = 1, .b = 2 }, &m, &floor, &box, 0, 1, rough, rough, null, rigid, rigid);
+    var c = prepare(.{ .a = 1, .b = 2 }, &m, &floor, &box, 0, 1, 0.5, 0, null, rigid, rigid);
     for (0..8) |_| solve(&c, &floor, &box, test_step, .solve);
 
     // The downward speed of 1 is stopped, which took a normal impulse of 1;
@@ -570,7 +568,7 @@ test "warm starting picks up the impulse by id, not by position" {
     m.points[0] = .{ .point = .init(-0.5, 0.5), .separation = 0, .id = 7 };
     m.points[1] = .{ .point = .init(0.5, 0.5), .separation = 0, .id = 9 };
     const last = [2]Impulse{ .{ .id = 9, .normal = 2 }, .{ .id = 7, .normal = 1 } };
-    const c = prepare(.{ .a = 1, .b = 2 }, &m, &floor, &box, 0, 1, .{}, .{}, last, rigid, rigid);
+    const c = prepare(.{ .a = 1, .b = 2 }, &m, &floor, &box, 0, 1, 0.6, 0, last, rigid, rigid);
     try testing.expectEqual(@as(f32, 1), c.points[0].normal_impulse);
     try testing.expectEqual(@as(f32, 2), c.points[1].normal_impulse);
 
