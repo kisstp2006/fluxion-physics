@@ -166,11 +166,12 @@ pub const Settings = struct {
     /// through a wall thinner than its step. See `continuous`.
     enable_continuous: bool = true,
     /// Which bits two shapes that push need to touch: both masks having the
-    /// other's category, Box2D's, or either, Godot 3's. A sensor's pair
-    /// always takes either; see `Filter.shouldSense`.
+    /// other's category, Box2D's, or either one's. A sensor's pair always
+    /// takes either; see `Filter.shouldSense`.
     filter_rule: shape_mod.FilterRule = .both,
     /// How a contact's friction and restitution come from its two surfaces'.
-    /// Box2D's by default; Godot 3's are `.minimum` and `.sum_clamped`.
+    /// Box2D's by default; `.minimum` and `.sum_clamped` are slipperier and
+    /// bouncier.
     friction_mix: shape_mod.Mix = .geometric_mean,
     restitution_mix: shape_mod.Mix = .maximum,
 };
@@ -250,8 +251,8 @@ static_tree: Tree = .empty,
 /// there is anything in it; see `bodyPairKey`.
 no_collide: std.AutoHashMapUnmanaged(u64, u32) = .empty,
 
-/// Pairs of bodies told never to touch - Godot's collision exceptions - by
-/// slot, with how many times each was asked. Apart from `no_collide` so a
+/// Pairs of bodies told never to touch - collision exceptions - by slot,
+/// with how many times each was asked. Apart from `no_collide` so a
 /// destroyed body takes its exceptions with it, where a joint goes anyway.
 exceptions: std.AutoHashMapUnmanaged(u64, u32) = .empty,
 
@@ -719,8 +720,7 @@ pub fn jointReaction(self: *World, handle: JointId) ?joint_mod.Reaction {
 }
 
 /// Keep two bodies from ever touching, whatever their filters say, until
-/// `removeCollisionException`: Godot's `add_collision_exception_with`.
-/// Counted, so two calls take two removals. What they touch now ends at
+/// `removeCollisionException`. Counted, so two calls take two removals. What they touch now ends at
 /// the next step, and both wake.
 pub fn addCollisionException(self: *World, a: BodyId, b: BodyId) JointError!void {
     if (self.bodies.getConst(a) == null or self.bodies.getConst(b) == null) return error.NoSuchBody;
@@ -1295,8 +1295,8 @@ fn mayTouch(world: *World, ea: *const ShapeEntry, eb: *const ShapeEntry, ba: *co
     const sensing = ea.def.sensor or eb.def.sensor;
     if (ba.type != .dynamic and bb.type != .dynamic and !sensing) return false;
     // A sensor is seen when either side asks for the other - a hitbox by the
-    // hurtbox that watches for it - and a push takes both, or with Godot's
-    // rule either.
+    // hurtbox that watches for it - and a push takes both, or with the
+    // `.either` rule either.
     const either = sensing or world.settings.filter_rule == .either;
     const filtered = if (either) ea.def.filter.shouldSense(eb.def.filter) else ea.def.filter.shouldCollide(eb.def.filter);
     if (!filtered) return false;
@@ -1440,8 +1440,8 @@ fn prepareContacts(self: *World, ctx: Step) Error!void {
 
 /// Whether a pair with a one-way shape in it holds, at its first touch:
 /// for each one-way side, the contact's normal says the other shape is on
-/// the side its arrow comes from. Godot 3.6's rule for bodies, which asks
-/// nothing of their speeds or depths. See `shape.OneWay`.
+/// the side its arrow comes from. The rule asks nothing of the bodies'
+/// speeds or depths. See `shape.OneWay`.
 fn holdsOneWay(m: *const Manifold, ea: *const ShapeEntry, eb: *const ShapeEntry, ba: *const Body, bb: *const Body) bool {
     const eps = 1e-5;
     // The manifold's normal is from A to B.

@@ -327,8 +327,8 @@ allocator and arithmetic.
 
 ## Filtering
 
-Thirty-two category bits, a mask, and a group: Box2D's scheme, with Godot's
-number of layers.
+Thirty-two category bits, a mask, and a group: Box2D's scheme, one bit for
+each layer.
 
 ```zig
 const player: physics.Filter = .{ .category = 0b01, .mask = 0b10 };  // touches only category 2
@@ -336,11 +336,11 @@ const ragdoll_part: physics.Filter = .{ .group = -7 };               // never to
 ```
 
 - **Two shapes that push need each one's mask to have the other's category.**
-  With `Settings.filter_rule = .either`, Godot 3's rule, one of them is
-  enough. A sensor is always seen when either side asks.
+  With `Settings.filter_rule = .either`, one of them is enough. A sensor is
+  always seen when either side asks.
 - **Two bodies can be kept apart whatever their bits say**:
-  `world.addCollisionException(a, b)`, Godot's collision exception. It is
-  counted, and goes when either body is destroyed.
+  `world.addCollisionException(a, b)`. It is counted, and goes when either
+  body is destroyed.
 
 ## One-way platforms
 
@@ -362,10 +362,10 @@ through.
 Friction and restitution are per shape. A contact makes its own from its two
 shapes' as `Settings.friction_mix` and `Settings.restitution_mix` say:
 
-| Setting | Default (Box2D) | Godot 3 |
+| Setting | Default (Box2D) | Another choice |
 |---|---|---|
-| `friction_mix` | `.geometric_mean`: ice on anything is slippery | `.minimum` |
-| `restitution_mix` | `.maximum`: a superball bounces off anything | `.sum_clamped` |
+| `friction_mix` | `.geometric_mean`: ice on anything is slippery | `.minimum`: the slipperier surface decides |
+| `restitution_mix` | `.maximum`: a superball bounces off anything | `.sum_clamped`: two half-bouncy things bounce all the way |
 
 ## What is not here
 

@@ -313,8 +313,9 @@ pub const Material = struct {
 };
 
 /// How two surfaces' values make the one their contact uses. Box2D's are
-/// the geometric mean for friction and the larger for restitution; Godot
-/// 3's the smaller for friction and the sum, up to one, for bounce.
+/// the geometric mean for friction and the larger for restitution; the
+/// smaller for friction and the sum, up to one, for bounce make a
+/// slipperier, bouncier pair.
 pub const Mix = enum {
     /// sqrt(a b): ice against anything is slippery, rubber on rubber grips.
     geometric_mean,
@@ -344,8 +345,8 @@ test "each mix makes the pair's value its way" {
     try testing.expectEqual(@as(f32, 1), Mix.sum_clamped.of(0.6, 0.7));
 }
 
-/// Who touches whom. Thirty-two categories and a group, which is Box2D's
-/// scheme with Godot's number of layers.
+/// Who touches whom. Thirty-two categories and a group, in Box2D's scheme:
+/// one bit for each layer.
 pub const Filter = struct {
     /// What this shape is. One bit, usually.
     category: u32 = 1,
@@ -395,8 +396,8 @@ test "a sensor's pair needs one side to ask for the other, a collision both" {
 pub const FilterRule = enum {
     /// Each one's mask has the other's category: Box2D's.
     both,
-    /// One of them does: Godot 3's, where a body's mask says what it
-    /// scans, and being scanned is enough.
+    /// One of them does: a body's mask says what it scans, and being
+    /// scanned is enough.
     either,
 };
 
@@ -412,10 +413,10 @@ test "a category in the thirty-second bit filters like the first" {
 }
 
 /// A platform that holds what lands on it from one side and lets through
-/// what comes from any other: Godot 3's one-way collision. Decided when the
-/// two first touch, and kept while they stay touching - so a body jumping
-/// up through a floor is let through all the way, and one standing on it
-/// is held however the solver jitters it.
+/// what comes from any other. Decided when the two first touch, and kept
+/// while they stay touching - so a body jumping up through a floor is let
+/// through all the way, and one standing on it is held however the solver
+/// jitters it.
 pub const OneWay = struct {
     /// The way something is held, in the frame of the body the shape is on:
     /// `+y`, down this screen, for a floor to stand on. A first touch holds

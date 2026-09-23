@@ -557,10 +557,10 @@ test "a step with nothing in it, and a step of no time, do nothing" {
 }
 
 // -------------------------------------------------------------------------
-// Godot's rules: which bits touch, exceptions, one-way floors, mixing
+// Which bits touch, exceptions, one-way floors, mixing
 // -------------------------------------------------------------------------
 
-test "with Godot's filter rule one mask asking is enough to touch, with Box2D's it takes both" {
+test "one mask asking is enough to touch with the either rule, and with Box2D's it takes both" {
     for ([_]physics.FilterRule{ .both, .either }) |rule| {
         var jobs: Jobs = try .init(gpa, .{ .io = null });
         defer jobs.deinit();
@@ -728,7 +728,7 @@ test "the sweep stops a fast body coming down onto a thin one-way floor, not one
     }
 }
 
-test "friction and restitution mix as the world says: Box2D's, or Godot's" {
+test "friction and restitution mix as the world says: Box2D's, or the smaller and the sum" {
     const Mixes = struct { friction: physics.Mix, restitution: physics.Mix };
     var slid: [2]f32 = undefined;
     var rose: [2]f32 = undefined;
