@@ -268,6 +268,37 @@ test "a box slid slowly across a floor of tiles keeps its speed at every seam" {
     }
 }
 
+test "a capsule slid across a floor of tiles, upright and lying, keeps its speed at every seam" {
+    // Its round end over a seam is over the next tile's top, not over a
+    // corner: it neither catches nor hops.
+    const shapes = [_]physics.Shape{
+        .{ .geometry = .{ .capsule = .{ .center1 = .init(0, -0.2), .center2 = .init(0, 0.2), .radius = 0.15 } }, .material = .{ .friction = 0 } },
+        .{ .geometry = .{ .capsule = .{ .center1 = .init(-0.3, 0), .center2 = .init(0.3, 0), .radius = 0.15 } }, .material = .{ .friction = 0 } },
+    };
+    const heights = [_]f32{ -0.35, -0.15 };
+    for ([_]Floor{ .body_per_tile, .one_body, .sizes_mixed }) |floor| {
+        for (shapes, heights) |shape, height| {
+            for ([_]f32{ 0.5, 3 }) |speed| {
+                var jobs: Jobs = try .init(gpa, .{});
+                defer jobs.deinit();
+                var world: World = .init(gpa, .{});
+                defer world.deinit();
+                try tiledFloor(&world, floor, 12);
+                const body = try world.createBody(.{ .position = .init(0, height), .allow_sleep = false, .fixed_rotation = true });
+                _ = try world.addShape(body, shape);
+                try steps(&world, &jobs, 30);
+                world.body(body).?.linear_velocity = .init(speed, 0);
+
+                const n: usize = @intFromFloat(3 / (speed * dt));
+                try steps(&world, &jobs, n);
+                const b = world.body(body).?;
+                try testing.expectApproxEqRel(speed, b.linear_velocity.x, 0.01);
+                try testing.expectApproxEqAbs(height, b.position().y, 0.02);
+            }
+        }
+    }
+}
+
 test "down a wall of tiles, a ball rolling, a box pushed along: all as on a slab" {
     var jobs: Jobs = try .init(gpa, .{});
     defer jobs.deinit();

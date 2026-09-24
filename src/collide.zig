@@ -24,7 +24,10 @@
 //! the separating axis test to find the reference face, the incident edge
 //! clipped against it, and the circle cases by regions of a polygon. It is
 //! well understood and its failure modes are known, which for a solver is
-//! worth more than novelty.
+//! worth more than novelty. A capsule pairs as its core - a polygon of two
+//! corners - with its radius round it, as Box2D v3 pairs rounded polygons:
+//! the separations less the radii, the points midway between the rounded
+//! surfaces, and two cores apart at two corners touching corner to corner.
 //!
 //! **`hidden` marks the edges of a polygon that another piece of the level
 //! covers**, one bit an edge (`Hidden`). A floor of separate tiles is a row
@@ -62,6 +65,7 @@ const cross = geometry.cross;
 const shape = @import("shape.zig");
 const Circle = shape.Circle;
 const Polygon = shape.Polygon;
+const Capsule = shape.Capsule;
 
 /// One place two shapes touch.
 pub const Point = struct {
@@ -433,10 +437,53 @@ fn clipSegment(in: [2]ClipVertex, normal: Vec2, offset: f32, vertex_index_a: usi
 /// Two convex polygons. The normal points from A towards B. `seams`: each
 /// one's covered edges; see `Seams`.
 pub fn polygons(a: *const Polygon, xa: Transform, b: *const Polygon, xb: Transform, margin: f32, seams: Seams) Manifold {
+    return roundedPolygons(a, 0, xa, b, 0, xb, margin, seams);
+}
+
+/// A polygon, as A, and a capsule. `seams.a`: the polygon's covered edges.
+pub fn polygonCapsule(poly: *const Polygon, xa: Transform, capsule: Capsule, xb: Transform, margin: f32, seams: Seams) Manifold {
+    const core = capsule.core();
+    return roundedPolygons(poly, 0, xa, &core, capsule.radius, xb, margin, seams);
+}
+
+/// Two capsules.
+pub fn capsules(a: Capsule, xa: Transform, b: Capsule, xb: Transform, margin: f32) Manifold {
+    const core_a = a.core();
+    const core_b = b.core();
+    return roundedPolygons(&core_a, a.radius, xa, &core_b, b.radius, xb, margin, .none);
+}
+
+/// A capsule, as A, and a circle: the circle against the nearest point of
+/// the capsule's segment, as two circles.
+pub fn capsuleCircle(capsule: Capsule, xa: Transform, circle: Circle, xb: Transform, margin: f32) Manifold {
+    const p1 = xa.apply(capsule.center1);
+    const p2 = xa.apply(capsule.center2);
+    const c = xb.apply(circle.center);
+    const nearest = shape.nearestOnSegment(c, p1, p2);
+    const d = c.sub(nearest);
+    const dist_sq = d.lenSq();
+    const r = capsule.radius + circle.radius;
+    if (dist_sq > (r + margin) * (r + margin)) return .none;
+    const dist = @sqrt(dist_sq);
+    const normal: Vec2 = if (dist > eps) d.scale(1 / dist) else xa.q.rotate(capsule.core().normals[0]);
+    var m: Manifold = .{ .normal = normal, .count = 1 };
+    m.points[0] = .{
+        .point = nearest.mulAdd(normal, capsule.radius).lerp(c.mulAdd(normal, -circle.radius), 0.5),
+        .separation = dist - r,
+        .id = 0,
+    };
+    return m;
+}
+
+/// Two convex polygons with a radius round each - zero for a polygon, a
+/// capsule's for its core. The separations are the cores', less the radii;
+/// the points are midway between the rounded surfaces.
+fn roundedPolygons(a: *const Polygon, ra: f32, xa: Transform, b: *const Polygon, rb: f32, xb: Transform, margin: f32, seams: Seams) Manifold {
+    const radius = ra + rb;
     const from_a = findMaxSeparation(a, xa, b, xb);
-    if (from_a.separation > margin) return .none;
+    if (from_a.separation > margin + radius) return .none;
     const from_b = findMaxSeparation(b, xb, a, xa);
-    if (from_b.separation > margin) return .none;
+    if (from_b.separation > margin + radius) return .none;
 
     // Which polygon supplies the reference face. B's is chosen only when it
     // is clearly better, so a pair whose two candidates are nearly equal
@@ -457,11 +504,11 @@ pub fn polygons(a: *const Polygon, xa: Transform, b: *const Polygon, xb: Transfo
             !isHidden(seams.b, edge1) and !isHidden(seams.a, incidentIndex(b, xb, edge1, a, xa))
         else
             !isHidden(seams.a, edge1) and !isHidden(seams.b, incidentIndex(a, xa, edge1, b, xb));
-        const shallow = @max(from_a.separation, from_b.separation) >= -seams.depth;
+        const shallow = @max(from_a.separation, from_b.separation) - radius >= -seams.depth;
         if (!allowed and shallow) {
             const open_a = findMaxVisibleSeparation(a, xa, seams.a, b, xb, seams.b);
             const open_b = findMaxVisibleSeparation(b, xb, seams.b, a, xa, seams.a);
-            const deep = -seams.depth;
+            const deep = radius - seams.depth;
             const ok_a = open_a != null and open_a.?.separation >= deep;
             const ok_b = open_b != null and open_b.?.separation >= deep;
             if (!ok_a and !ok_b) return .none;
@@ -474,6 +521,8 @@ pub fn polygons(a: *const Polygon, xa: Transform, b: *const Polygon, xb: Transfo
     const poly2 = if (flip) a else b;
     const xf1 = if (flip) xb else xa;
     const xf2 = if (flip) xa else xb;
+    const r1 = if (flip) rb else ra;
+    const r2 = if (flip) ra else rb;
 
     const incident = findIncidentEdge(poly1, xf1, edge1, poly2, xf2, flip);
 
@@ -489,6 +538,44 @@ pub fn polygons(a: *const Polygon, xa: Transform, b: *const Polygon, xb: Transfo
     const v11 = xf1.apply(v11_local);
     const v12 = xf1.apply(v12_local);
 
+    // Rounded cores that are apart touch where their surfaces nearest each
+    // other do, which past the ends of the two edges is corner to corner -
+    // and there the reference face's normal is not the way they touch: a
+    // capsule over the edge of a step touches the step's corner along the
+    // line between the two, and rolls off it.
+    if (radius > 0 and @max(from_a.separation, from_b.separation) > 0) {
+        const nearest = segmentsNearest(v11, v12, incident[0].v, incident[1].v);
+        const at_end1 = nearest.fraction1 == 0 or nearest.fraction1 == 1;
+        const at_end2 = nearest.fraction2 == 0 or nearest.fraction2 == 1;
+        // A corner with a covered edge beside it is no corner: the surface
+        // runs straight on into the next piece of the level, and what rests
+        // there rests on the face - as for a circle, in `cornerPoint`.
+        const hidden1 = if (flip) seams.b else seams.a;
+        const hidden2 = if (flip) seams.a else seams.b;
+        const corner1: usize = if (nearest.fraction1 == 0) iv1 else iv2;
+        const corner2: usize = if (nearest.fraction2 == 0) incident[0].feature.index_b else incident[1].feature.index_b;
+        const covered = isHidden(hidden1, corner1) or isHidden(hidden1, (corner1 + poly1.count - 1) % poly1.count) or
+            isHidden(hidden2, corner2) or isHidden(hidden2, (corner2 + poly2.count - 1) % poly2.count);
+        const dist = @sqrt(nearest.distance_sq);
+        const way: Vec2 = if (dist > eps) nearest.point2.sub(nearest.point1).scale(1 / dist) else normal;
+        // Straight out of the face, the corners are the face's: two edges
+        // side by side whose ends are level touch along their length, and
+        // the face makes the two points that hold them.
+        const along_face = way.dot(normal) > 1 - 1e-4;
+        if (at_end1 and at_end2 and !covered and !along_face) {
+            if (dist > margin + radius) return .none;
+            const surface1 = nearest.point1.mulAdd(way, r1);
+            const surface2 = nearest.point2.mulAdd(way, -r2);
+            var m: Manifold = .{ .normal = if (flip) way.neg() else way, .count = 1 };
+            m.points[0] = .{
+                .point = surface1.lerp(surface2, 0.5),
+                .separation = dist - radius,
+                .id = (Feature{ .index_a = @intCast(corner1), .index_b = @intCast(corner2), .type_a = .vertex, .type_b = .vertex, .flipped = flip }).id(),
+            };
+            return m;
+        }
+    }
+
     const front_offset = normal.dot(v11);
     const side_offset1 = -tangent.dot(v11);
     const side_offset2 = tangent.dot(v12);
@@ -501,13 +588,15 @@ pub fn polygons(a: *const Polygon, xa: Transform, b: *const Polygon, xb: Transfo
 
     var m: Manifold = .{ .normal = if (flip) normal.neg() else normal };
     for (second.out) |cp| {
-        const separation = normal.dot(cp.v) - front_offset;
+        const core_separation = normal.dot(cp.v) - front_offset;
+        const separation = core_separation - radius;
         if (separation <= margin) {
             m.points[m.count] = .{
-                // The clipped point is on the incident face; move it halfway
-                // to the reference face so the contact sits between the two
-                // surfaces.
-                .point = cp.v.mulAdd(normal, -0.5 * separation),
+                // The clipped point is on the incident core; the contact
+                // sits midway between the two rounded surfaces - the
+                // reference face moved out by its radius, the incident
+                // point in by its.
+                .point = cp.v.mulAdd(normal, 0.5 * (r1 - r2 - core_separation)),
                 .separation = separation,
                 .id = cp.feature.id(),
             };
@@ -515,6 +604,55 @@ pub fn polygons(a: *const Polygon, xa: Transform, b: *const Polygon, xb: Transfo
         }
     }
     return m;
+}
+
+/// The nearest points of two segments, how far along each they are, and
+/// how far apart, squared.
+const Nearest = struct {
+    point1: Vec2,
+    point2: Vec2,
+    fraction1: f32,
+    fraction2: f32,
+    distance_sq: f32,
+};
+
+/// The nearest points of the segments from `p1` to `q1` and from `p2` to
+/// `q2`: Ericson's, from Real-Time Collision Detection, a fraction clamped
+/// to its segment exactly at an end so that a caller can tell a corner.
+fn segmentsNearest(p1: Vec2, q1: Vec2, p2: Vec2, q2: Vec2) Nearest {
+    const d1 = q1.sub(p1);
+    const d2 = q2.sub(p2);
+    const r = p1.sub(p2);
+    const dd1 = d1.lenSq();
+    const dd2 = d2.lenSq();
+    const rd1 = r.dot(d1);
+    const rd2 = r.dot(d2);
+    var f1: f32 = 0;
+    var f2: f32 = 0;
+    if (dd1 < eps and dd2 < eps) {
+        // Two points.
+    } else if (dd1 < eps) {
+        f2 = std.math.clamp(rd2 / dd2, 0, 1);
+    } else if (dd2 < eps) {
+        f1 = std.math.clamp(-rd1 / dd1, 0, 1);
+    } else {
+        const d12 = d1.dot(d2);
+        const denominator = dd1 * dd2 - d12 * d12;
+        // Parallel segments have no one nearest pair: the start of the
+        // first will do, and the second is then found for it.
+        f1 = if (denominator != 0) std.math.clamp((d12 * rd2 - rd1 * dd2) / denominator, 0, 1) else 0;
+        f2 = (d12 * f1 + rd2) / dd2;
+        if (f2 < 0) {
+            f2 = 0;
+            f1 = std.math.clamp(-rd1 / dd1, 0, 1);
+        } else if (f2 > 1) {
+            f2 = 1;
+            f1 = std.math.clamp((d12 - rd1) / dd1, 0, 1);
+        }
+    }
+    const point1 = p1.mulAdd(d1, f1);
+    const point2 = p2.mulAdd(d2, f2);
+    return .{ .point1 = point1, .point2 = point2, .fraction1 = f1, .fraction2 = f2, .distance_sq = point1.distSq(point2) };
 }
 
 // -------------------------------------------------------------------------
@@ -703,4 +841,56 @@ test "ids follow the corners when the incident edge is clipped" {
     const fa: Feature = @bitCast(m.points[0].id);
     const fb: Feature = @bitCast(m.points[1].id);
     try testing.expect(fa.type_a != fb.type_a);
+}
+
+test "a capsule stands on a box's face with two points, as a box would" {
+    const floor: Polygon = .box(4, 0.5);
+    const person: Capsule = .{ .center1 = .init(-0.5, 0), .center2 = .init(0.5, 0), .radius = 0.25 };
+    // Lying on its side just into the top of the floor, y being down.
+    const m = polygonCapsule(&floor, .identity, person, .init(.init(0, -0.74), 0), 0, .none);
+    try testing.expectEqual(@as(u32, 2), m.count);
+    try testing.expect(m.normal.approxEql(.init(0, -1)));
+    try testing.expectApproxEqAbs(@as(f32, -0.01), m.points[0].separation, 1e-5);
+    // Midway between the floor's top and the capsule's bottom.
+    try testing.expectApproxEqAbs(@as(f32, -0.495), m.points[0].point.y, 1e-5);
+}
+
+test "a capsule over a step's corner touches it along the line between them" {
+    const step: Polygon = .box(1, 1);
+    // Upright, its bottom end out past the step's top right corner and just
+    // over it, diagonally.
+    const person: Capsule = .{ .center1 = .init(0, -1), .center2 = .init(0, 0), .radius = 0.5 };
+    const at = Vec2.init(1.3, -1.3);
+    const m = polygonCapsule(&step, .identity, person, .init(at, 0), 0.1, .none);
+    try testing.expectEqual(@as(u32, 1), m.count);
+    // Out of the corner towards the capsule's end, not straight up.
+    try testing.expectApproxEqAbs(@as(f32, 1.0 / @sqrt(2.0)), m.normal.x, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, -1.0 / @sqrt(2.0)), m.normal.y, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 0.3 * @sqrt(2.0) - 0.5), m.points[0].separation, 1e-4);
+}
+
+test "a capsule and a circle, and two capsules" {
+    const person: Capsule = .{ .center1 = .init(0, -1), .center2 = .init(0, 1), .radius = 0.5 };
+    const ball: Circle = .{ .radius = 0.5 };
+    const side = capsuleCircle(person, .identity, ball, .init(.init(0.9, 0.3), 0), 0);
+    try testing.expectEqual(@as(u32, 1), side.count);
+    try testing.expect(side.normal.approxEql(.unit_x));
+    try testing.expectApproxEqAbs(@as(f32, -0.1), side.points[0].separation, 1e-5);
+    try testing.expectEqual(@as(u32, 0), capsuleCircle(person, .identity, ball, .init(.init(0, 2.1), 0), 0).count);
+
+    // Two upright side by side touch along their sides, at two points.
+    const pair = capsules(person, .identity, person, .init(.init(0.95, 0), 0), 0);
+    try testing.expectEqual(@as(u32, 2), pair.count);
+    try testing.expect(pair.normal.approxEql(.unit_x));
+    try testing.expectApproxEqAbs(@as(f32, -0.05), pair.points[0].separation, 1e-5);
+}
+
+test "the nearest points of two segments, at their ends and between" {
+    const cross_ = segmentsNearest(.init(-1, 0), .init(1, 0), .init(0, 1), .init(0, 3));
+    try testing.expectApproxEqAbs(@as(f32, 0.5), cross_.fraction1, 1e-6);
+    try testing.expectEqual(@as(f32, 0), cross_.fraction2);
+    try testing.expectApproxEqAbs(@as(f32, 1), cross_.distance_sq, 1e-6);
+    const corners = segmentsNearest(.init(0, 0), .init(1, 0), .init(2, 1), .init(3, 2));
+    try testing.expectEqual(@as(f32, 1), corners.fraction1);
+    try testing.expectEqual(@as(f32, 0), corners.fraction2);
 }

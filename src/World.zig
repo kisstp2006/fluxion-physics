@@ -1101,7 +1101,7 @@ fn coverEdges(self: *World, index: u32) void {
     if (entry.def.sensor) return;
     const poly = switch (entry.def.geometry) {
         .polygon => |*p| p,
-        .circle => return,
+        .circle, .capsule => return,
     };
     const xf = self.bodyAt(entry.body_index).transform;
     const reach = self.settings.linear_slop * self.settings.units_per_metre;
@@ -1333,17 +1333,28 @@ pub fn manifoldOf(a: *const shape_mod.Geometry, xa: Transform, b: *const shape_m
     return switch (a.*) {
         .circle => |ca| switch (b.*) {
             .circle => |cb| collide.circles(ca, xa, cb, xb, margin),
-            .polygon => |*pb| blk: {
-                var m = collide.polygonCircle(pb, xb, ca, xa, margin, seams.swapped());
-                m.normal = m.normal.neg();
-                break :blk m;
-            },
+            .polygon => |*pb| turned(collide.polygonCircle(pb, xb, ca, xa, margin, seams.swapped())),
+            .capsule => |cb| turned(collide.capsuleCircle(cb, xb, ca, xa, margin)),
         },
         .polygon => |*pa| switch (b.*) {
             .circle => |cb| collide.polygonCircle(pa, xa, cb, xb, margin, seams),
             .polygon => |*pb| collide.polygons(pa, xa, pb, xb, margin, seams),
+            .capsule => |cb| collide.polygonCapsule(pa, xa, cb, xb, margin, seams),
+        },
+        .capsule => |ca| switch (b.*) {
+            .circle => |cb| collide.capsuleCircle(ca, xa, cb, xb, margin),
+            .polygon => |*pb| turned(collide.polygonCapsule(pb, xb, ca, xa, margin, seams.swapped())),
+            .capsule => |cb| collide.capsules(ca, xa, cb, xb, margin),
         },
     };
+}
+
+/// A pairing written the other way round, its normal turned back to run
+/// from A to B.
+fn turned(m: Manifold) Manifold {
+    var out = m;
+    out.normal = m.normal.neg();
+    return out;
 }
 
 /// Every touching pair into `contacts`, and every one that pushes into a
@@ -2132,6 +2143,25 @@ fn rayAgainst(g: *const shape_mod.Geometry, xf: Transform, origin: Vec2, transla
             const i = index orelse return null;
             return .{ .fraction = lower, .normal = xf.q.rotate(poly.normals[i]) };
         },
+        .capsule => |c| {
+            // The nearer of the rectangle along the segment and the discs at
+            // its ends: a capsule is all three.
+            const core = c.core();
+            const side = core.normals[0].scale(c.radius);
+            const box = shape_mod.Polygon.fromPoints(&.{ c.center1.add(side), c.center2.add(side), c.center2.sub(side), c.center1.sub(side) }) catch null;
+            var best: ?LocalHit = null;
+            const parts = [_]?shape_mod.Geometry{
+                if (box) |b| .{ .polygon = b } else null,
+                .{ .circle = .{ .center = c.center1, .radius = c.radius } },
+                .{ .circle = .{ .center = c.center2, .radius = c.radius } },
+            };
+            for (parts) |maybe| {
+                const part = maybe orelse continue;
+                const hit = rayAgainst(&part, xf, origin, translation, if (best) |held| held.fraction else max_fraction) orelse continue;
+                best = hit;
+            }
+            return best;
+        },
     }
 }
 
@@ -2163,11 +2193,174 @@ pub fn overlapPoint(self: *World, point: Vec2) ?ShapeId {
 fn containsPoint(self: *World, index: u32, point: Vec2) bool {
     const entry = &self.shapes.slots.items[index].value.?;
     const local = self.bodyAt(entry.body_index).transform.unapply(point);
-    return switch (entry.def.geometry) {
-        .circle => |c| local.distSq(c.center) <= c.radius * c.radius,
-        .polygon => |*p| p.containsLocal(local),
-    };
+    return entry.def.geometry.containsLocal(local);
 }
+
+/// What a shape cast along a path hit first. See `castShape`.
+pub const ShapeHit = struct {
+    shape: ShapeId,
+    body: BodyId,
+    /// Where the two touch, in the world.
+    point: Vec2,
+    /// Out of what was hit, towards the cast shape.
+    normal: Vec2,
+    /// How far along the path the cast shape stops, from nought to one:
+    /// `margin` short of touching.
+    fraction: f32,
+};
+
+/// Who a shape cast or an overlap asks about, and how near is touching.
+pub const CastOptions = struct {
+    /// Asks the shapes this filter pushes, by the world's `filter_rule`;
+    /// sensors never.
+    filter: Filter = .{},
+    /// A body whose shapes are passed over: the caster's own.
+    ignore: ?BodyId = null,
+    /// How far short of touching counts as touching.
+    margin: f32 = 0,
+};
+
+/// The first shape `geometry`, placed at `xf` and carried along
+/// `translation` without turning, comes within `options.margin` of: what a
+/// character moves by, and stops at. Null if nothing.
+///
+/// A shape it starts within the margin of stops it at nought only when the
+/// path goes into it: moving along a floor or away from a wall is free. A
+/// one-way shape stops it only moving the way the shape holds, from outside
+/// it. The moving shapes are asked one by one, and the level through its
+/// tree with the box the whole path sweeps.
+pub fn castShape(self: *World, g: *const shape_mod.Geometry, xf: Transform, translation: Vec2, options: CastOptions) ?ShapeHit {
+    const at_start = g.aabb(xf);
+    const at_end: Aabb = .{ .min = at_start.min.add(translation), .max = at_start.max.add(translation) };
+    const swept = at_start.join(at_end).grow(options.margin + self.castTolerance());
+    var cast: ShapeCast = .{ .world = self, .geometry = g, .xf = xf, .translation = translation, .options = options, .tolerance = self.castTolerance() };
+    for (self.sweep.order.items) |index| {
+        const entry = &self.shapes.slots.items[index].value.?;
+        const b = self.bodyAt(entry.body_index);
+        if (!boxNears(b, swept)) continue;
+        _ = cast.consider(index);
+    }
+    self.static_tree.query(swept, &cast, ShapeCast.consider);
+    return cast.best;
+}
+
+/// Whether two filters let their shapes push each other, by the world's
+/// `filter_rule`, as a step decides it.
+fn filtersPush(self: *const World, a: Filter, b: Filter) bool {
+    return if (self.settings.filter_rule == .either) a.shouldSense(b) else a.shouldCollide(b);
+}
+
+/// How close a cast brings a shape to its margin: a quarter of the slop.
+fn castTolerance(self: *const World) f32 {
+    return 0.25 * self.settings.linear_slop * self.settings.units_per_metre;
+}
+
+const ShapeCast = struct {
+    world: *World,
+    geometry: *const shape_mod.Geometry,
+    xf: Transform,
+    translation: Vec2,
+    options: CastOptions,
+    tolerance: f32,
+    best: ?ShapeHit = null,
+
+    fn consider(self: *ShapeCast, index: u32) bool {
+        const world = self.world;
+        const entry = &world.shapes.slots.items[index].value.?;
+        if (entry.def.sensor or !world.filtersPush(self.options.filter, entry.def.filter)) return true;
+        if (self.options.ignore) |own| if (std.meta.eql(own, entry.body)) return true;
+        const xo = world.bodyAt(entry.body_index).transform;
+        const other = &entry.def.geometry;
+        const margin = self.options.margin;
+        const start = continuous.separation(self.geometry, self.xf, other, xo);
+        if (entry.def.one_way) |one| {
+            // Held only going its way, from outside it.
+            if (self.translation.dot(xo.q.rotate(one.direction)) <= 0 or start.distance < -self.tolerance) return true;
+        }
+        const limit = if (self.best) |held| held.fraction else 1;
+        if (start.distance <= margin + self.tolerance) {
+            // Touching already: only going into it stops the shape - by
+            // more than the rounding of a normal worked out from where the
+            // two are, which is all a path along a floor does.
+            const into = self.translation.dot(start.normal);
+            if (into <= 1e-4 * self.translation.len()) return true;
+            self.keep(index, entry.body, 0, self.xf, other, xo, start.normal.neg());
+            return true;
+        }
+        const path: continuous.Sweep = .{ .local_center = .zero, .c0 = self.xf.p, .a0 = self.xf.q.angle(), .c1 = self.xf.p.add(self.translation), .a1 = self.xf.q.angle() };
+        switch (continuous.timeOfImpact(self.geometry, path, other, xo, limit, margin, self.tolerance)) {
+            .miss, .touching => {},
+            .hit => |t| {
+                const at = path.at(t);
+                const there = continuous.separation(self.geometry, at, other, xo);
+                self.keep(index, entry.body, t, at, other, xo, there.normal.neg());
+            },
+        }
+        return true;
+    }
+
+    fn keep(self: *ShapeCast, index: u32, body_id: BodyId, fraction: f32, at: Transform, other: *const shape_mod.Geometry, xo: Transform, normal: Vec2) void {
+        if (self.best) |held| if (held.fraction <= fraction) return;
+        // Where they touch: the nearest point of the pair, or failing that
+        // a point on the cast shape's surface along the normal.
+        const m = manifoldOf(self.geometry, at, other, xo, self.options.margin + 4 * self.tolerance, .none);
+        const point = if (m.count > 0) m.points[0].point else at.p;
+        self.best = .{ .shape = self.world.handleOf(index), .body = body_id, .point = point, .normal = normal, .fraction = fraction };
+    }
+};
+
+/// A shape `overlapShape` found within its margin.
+pub const Overlap = struct {
+    shape: ShapeId,
+    body: BodyId,
+    /// Out of what it overlaps, towards the asking shape: the way out.
+    normal: Vec2,
+    /// How far along `normal` the asking shape has to go to be `margin`
+    /// clear of it.
+    depth: f32,
+};
+
+/// Every shape `geometry` at `xf` is within `options.margin` of, into
+/// `found`, with the way out of each - as many as it holds. What a
+/// character is pushed out of before it moves.
+pub fn overlapShape(self: *World, g: *const shape_mod.Geometry, xf: Transform, options: CastOptions, found: []Overlap) []Overlap {
+    const box = g.aabb(xf).grow(options.margin);
+    var probe: OverlapProbe = .{ .world = self, .geometry = g, .xf = xf, .options = options, .found = found };
+    for (self.sweep.order.items) |index| {
+        const entry = &self.shapes.slots.items[index].value.?;
+        const b = self.bodyAt(entry.body_index);
+        if (!boxNears(b, box)) continue;
+        if (!probe.consider(index)) break;
+    }
+    if (probe.count < found.len) self.static_tree.query(box, &probe, OverlapProbe.consider);
+    return found[0..probe.count];
+}
+
+const OverlapProbe = struct {
+    world: *World,
+    geometry: *const shape_mod.Geometry,
+    xf: Transform,
+    options: CastOptions,
+    found: []Overlap,
+    count: usize = 0,
+
+    fn consider(self: *OverlapProbe, index: u32) bool {
+        if (self.count == self.found.len) return false;
+        const world = self.world;
+        const entry = &world.shapes.slots.items[index].value.?;
+        if (entry.def.sensor or !world.filtersPush(self.options.filter, entry.def.filter)) return true;
+        if (self.options.ignore) |own| if (std.meta.eql(own, entry.body)) return true;
+        // A one-way shape holds from its side only: what is in it is on
+        // its way through.
+        if (entry.def.one_way != null) return true;
+        const xo = world.bodyAt(entry.body_index).transform;
+        const s = continuous.separation(self.geometry, self.xf, &entry.def.geometry, xo);
+        if (s.distance >= self.options.margin) return true;
+        self.found[self.count] = .{ .shape = world.handleOf(index), .body = entry.body, .normal = s.normal.neg(), .depth = self.options.margin - s.distance };
+        self.count += 1;
+        return true;
+    }
+};
 
 /// Call `visit(context, shape)` for every shape whose box overlaps `box`,
 /// until it returns false: the moving shapes, then the level's.

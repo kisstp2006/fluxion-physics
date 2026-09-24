@@ -233,6 +233,20 @@ export fn shapes() u32 {
                     r[6 + i * 2] = v.y;
                 }
             },
+            // Drawn as the outline a polygon of eight corners makes of it:
+            // four round each end.
+            .capsule => |c| {
+                r[0] = 1;
+                r[4] = 8;
+                const along = c.center2.sub(c.center1);
+                const turn = std.math.atan2(along.y, along.x);
+                for (0..8) |i| {
+                    const end = if (i < 4) c.center2 else c.center1;
+                    const angle = turn - std.math.pi / 2.0 + @as(f32, @floatFromInt(i)) * std.math.pi / 3.0 - (if (i < 4) @as(f32, 0) else std.math.pi / 3.0);
+                    r[5 + i * 2] = end.x + c.radius * @cos(angle);
+                    r[6 + i * 2] = end.y + c.radius * @sin(angle);
+                }
+            },
         }
         // Static bodies are neither: draw them as the scenery they are.
         r[21] = switch (b.type) {

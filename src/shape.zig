@@ -1,20 +1,28 @@
 // SPDX-License-Identifier: BSD-2-Clause
 
-//! What a body is made of: circles and convex polygons, what they weigh, and
-//! what they will and will not touch.
+//! What a body is made of: circles, capsules and convex polygons, what they
+//! weigh, and what they will and will not touch.
 //!
 //! ```zig
 //! const ball: Shape = .circle(0.5);
 //! const crate: Shape = .box(1, 1);
+//! const person: Shape = .capsule(.init(0, -0.5), .init(0, 0.5), 0.3);
 //! const wedge: Shape = .{ .geometry = .{ .polygon = try .fromPoints(&.{ a, b, c }) } };
 //! ```
 //!
-//! **Two geometries, and the list is short on purpose.** A circle and a
-//! convex polygon of up to eight vertices cover crates, balls, ramps, wheels
-//! and characters, and any concave outline is several convex ones on one
-//! body. Each geometry pairs with each in the narrow phase, so every one
-//! added is a row and a column of pairings to write and to keep correct;
-//! capsules and rounded polygons are the next two and they are not here yet.
+//! **Three geometries, and the list is short on purpose.** A circle, a
+//! capsule and a convex polygon of up to eight vertices cover crates, balls,
+//! ramps, wheels and characters, and any concave outline is several convex
+//! ones on one body. Each geometry pairs with each in the narrow phase, so
+//! every one added is a row and a column of pairings to write and to keep
+//! correct.
+//!
+//! **A capsule is a segment with a radius round it**: round at both ends, so
+//! a character slides over a step's edge and off a ledge rather than
+//! catching on it, and flat along its sides, so it stands straight against a
+//! wall. It pairs as its core - the segment, as a polygon of two corners -
+//! with the radius added, which is how rounded polygons are paired, and so
+//! it takes the level's seams as any polygon does.
 //!
 //! **A polygon is always convex and always wound the same way**, because
 //! `fromPoints` builds the convex hull of whatever it is given and the
@@ -69,6 +77,66 @@ pub const Circle = extern struct {
         };
     }
 };
+
+/// Every point within `radius` of the segment from `center1` to `center2`,
+/// in the body's frame.
+pub const Capsule = extern struct {
+    center1: Vec2,
+    center2: Vec2,
+    radius: f32,
+
+    pub fn aabb(self: Capsule, xf: Transform) Aabb {
+        const a = xf.apply(self.center1);
+        const b = xf.apply(self.center2);
+        return .{ .min = a.min(b).sub(.splat(self.radius)), .max = a.max(b).add(.splat(self.radius)) };
+    }
+
+    /// A rectangle between the two centres and two half discs at the ends:
+    /// Box2D's arithmetic, a parallel axis for each half disc's centroid.
+    pub fn massData(self: Capsule, density: f32) MassData {
+        const rr = self.radius * self.radius;
+        const length = self.center2.sub(self.center1).len();
+        const circle_mass = density * std.math.pi * rr;
+        const box_mass = density * 2 * self.radius * length;
+        const mass = circle_mass + box_mass;
+        const center = self.center1.lerp(self.center2, 0.5);
+        // Where a half disc's area is from its flat side, and half the
+        // length: a half disc moved to its end of the rectangle.
+        const lc = 4 * self.radius / (3 * std.math.pi);
+        const h = 0.5 * length;
+        const circle_inertia = circle_mass * (0.5 * rr + h * h + 2 * h * lc);
+        const box_inertia = box_mass * (4 * rr + length * length) / 12;
+        return .{ .mass = mass, .center = center, .inertia = circle_inertia + box_inertia + mass * center.lenSq() };
+    }
+
+    /// Its core: the segment, as a polygon of two corners and a normal on
+    /// each side of it, which is how the narrow phase and the gap between
+    /// shapes read it, with the radius added.
+    pub fn core(self: Capsule) Polygon {
+        const along = self.center2.sub(self.center1);
+        const len = along.len();
+        const normal: Vec2 = if (len > std.math.floatEps(f32)) geometry.crossVS(along.scale(1 / len), 1) else .unit_y;
+        var p: Polygon = .{ .vertices = undefined, .normals = undefined, .count = 2 };
+        p.vertices[0] = self.center1;
+        p.vertices[1] = self.center2;
+        p.normals[0] = normal;
+        p.normals[1] = normal.neg();
+        return p;
+    }
+
+    /// Whether a point in the body's frame is inside.
+    pub fn containsLocal(self: Capsule, p: Vec2) bool {
+        return nearestOnSegment(p, self.center1, self.center2).distSq(p) <= self.radius * self.radius;
+    }
+};
+
+/// The point of the segment from `a` to `b` nearest `p`.
+pub fn nearestOnSegment(p: Vec2, a: Vec2, b: Vec2) Vec2 {
+    const e = b.sub(a);
+    const len_sq = e.lenSq();
+    if (len_sq <= 0) return a;
+    return a.mulAdd(e, std.math.clamp(p.sub(a).dot(e) / len_sq, 0, 1));
+}
 
 /// A convex polygon, wound so that its signed area is positive, with an
 /// outward unit normal per edge kept beside the vertices.
@@ -240,15 +308,17 @@ pub const Polygon = extern struct {
     }
 };
 
-/// The two kinds of geometry a shape can be.
+/// The three kinds of geometry a shape can be.
 pub const Geometry = union(enum) {
     circle: Circle,
     polygon: Polygon,
+    capsule: Capsule,
 
     pub fn aabb(self: *const Geometry, xf: Transform) Aabb {
         return switch (self.*) {
             .circle => |c| c.aabb(xf),
             .polygon => |*p| p.aabb(xf),
+            .capsule => |c| c.aabb(xf),
         };
     }
 
@@ -256,6 +326,7 @@ pub const Geometry = union(enum) {
         return switch (self.*) {
             .circle => |c| c.massData(density),
             .polygon => |*p| p.massData(density),
+            .capsule => |c| c.massData(density),
         };
     }
 
@@ -264,6 +335,16 @@ pub const Geometry = union(enum) {
         return switch (self.*) {
             .circle => |c| c.center,
             .polygon => |*p| p.massData(1).center,
+            .capsule => |c| c.center1.lerp(c.center2, 0.5),
+        };
+    }
+
+    /// Whether a point in the body's frame is inside.
+    pub fn containsLocal(self: *const Geometry, p: Vec2) bool {
+        return switch (self.*) {
+            .circle => |c| p.distSq(c.center) <= c.radius * c.radius,
+            .polygon => |*poly| poly.containsLocal(p),
+            .capsule => |c| c.containsLocal(p),
         };
     }
 
@@ -272,6 +353,7 @@ pub const Geometry = union(enum) {
     pub fn reach(self: *const Geometry, from: Vec2) f32 {
         return switch (self.*) {
             .circle => |c| c.center.dist(from) + c.radius,
+            .capsule => |c| @max(c.center1.dist(from), c.center2.dist(from)) + c.radius,
             .polygon => |*p| blk: {
                 var far: f32 = 0;
                 for (p.vertexSlice()) |v| far = @max(far, v.dist(from));
@@ -287,6 +369,7 @@ pub const Geometry = union(enum) {
     pub fn minExtent(self: *const Geometry) f32 {
         return switch (self.*) {
             .circle => |c| c.radius,
+            .capsule => |c| c.radius,
             .polygon => |*p| blk: {
                 const middle = p.massData(1).center;
                 var least = std.math.floatMax(f32);
@@ -447,6 +530,11 @@ pub const Shape = struct {
     pub fn box(half_width: f32, half_height: f32) Shape {
         return .{ .geometry = .{ .polygon = .box(half_width, half_height) } };
     }
+
+    /// A capsule round the segment from `center1` to `center2`.
+    pub fn capsule(center1: Vec2, center2: Vec2, radius: f32) Shape {
+        return .{ .geometry = .{ .capsule = .{ .center1 = center1, .center2 = center2, .radius = radius } } };
+    }
 };
 
 // -------------------------------------------------------------------------
@@ -517,6 +605,27 @@ test "filters: bits, then groups override them" {
     try testing.expect(!same_negative.shouldCollide(same_negative));
     const same_positive: Filter = .{ .group = 3, .category = 0, .mask = 0 };
     try testing.expect(same_positive.shouldCollide(same_positive));
+}
+
+test "a capsule weighs a rectangle and a disc, and its core is its segment" {
+    const c: Capsule = .{ .center1 = .init(0, -1), .center2 = .init(0, 1), .radius = 0.5 };
+    const m = c.massData(1);
+    try testing.expectApproxEqAbs(@as(f32, 2 * 0.5 * 2 + std.math.pi * 0.25), m.mass, 1e-5);
+    try testing.expect(m.center.approxEql(.zero));
+    // Heavier to spin than the rectangle alone, lighter than a rod of its
+    // whole length.
+    try testing.expect(m.inertia > 2 * (0.25 + 4) / 12.0);
+
+    const core = c.core();
+    try testing.expectEqual(@as(u32, 2), core.count);
+    try testing.expect(core.normals[0].approxEql(core.normals[1].neg()));
+    try testing.expect(c.containsLocal(.init(0.45, 0.5)));
+    try testing.expect(c.containsLocal(.init(0, 1.45)));
+    try testing.expect(!c.containsLocal(.init(0.4, 1.4)));
+
+    const box = c.aabb(.init(.init(10, 0), 0));
+    try testing.expectApproxEqAbs(@as(f32, 9.5), box.min.x, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1.5), box.max.y, 1e-6);
 }
 
 test "a box around a turned polygon holds every corner" {

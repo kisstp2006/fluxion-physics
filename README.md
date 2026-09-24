@@ -7,7 +7,7 @@ none at all, which is the browser.
 | --- | --- |
 | `World` | The bodies, the shapes and joints on them, and one step of time. |
 | `Body` | A rigid body: where it is, how it moves, what it weighs, whether it sleeps. |
-| `shape` | Circles and convex polygons, materials, and who touches whom. |
+| `shape` | Circles, capsules and convex polygons, materials, and who touches whom. |
 | `joint` | Hinges, sliders, rods, ropes, springs, welds, wheels, and a pointer to drag with. |
 | `collide` | Where two shapes touch, and how deep. |
 | `broadphase` | Which pairs of moving shapes are close enough to be worth asking. |
@@ -59,10 +59,16 @@ Kinematic moves the way it is told and is pushed by nothing. Dynamic is what
 physics is for. Only dynamic bodies collide with each other - a sensor sees
 the rest too - and a kinematic platform carries what stands on it.
 
-**Two geometries, on purpose.** A circle and a convex polygon of up to eight
-corners. `Polygon.fromPoints` takes corners in any order and hands back the
-convex hull, so a shape is never concave by accident and never wound the
-wrong way. Several shapes on one body make a compound.
+**Three geometries, on purpose.** A circle, a capsule and a convex polygon
+of up to eight corners. `Polygon.fromPoints` takes corners in any order and
+hands back the convex hull, so a shape is never concave by accident and never
+wound the wrong way. Several shapes on one body make a compound. A capsule -
+`Shape.capsule(center1, center2, radius)`, every point within the radius of
+a segment - is what a character stands in: round at both ends, so it slides
+over a step's edge and off a ledge, and flat along its sides against a wall.
+It pairs as its core, a polygon of two corners, with its radius round it -
+Box2D v3's rounded polygons - so it keeps its speed over the level's seams as
+a box does, and touches a corner along the line between the two.
 
 **Mass comes from density and area**, so a big crate is heavier than a small
 one without anyone typing a mass, and a body's centre of mass is where its
@@ -324,6 +330,16 @@ allocator and arithmetic.
   `overlapPoint` for what is under the mouse, `overlapAabb` for everything in
   a box. The level answers from its tree; the shapes that move are asked one
   by one, after a circle round each body has turned most of them away.
+- **A shape moved by hand**: `castShape(geometry, transform, translation,
+  options)` is the first thing a shape carried along a line comes within
+  `options.margin` of - where it stops, the way out of what it met, and how
+  far along - and `overlapShape` is everything it is within the margin of
+  now, with the way out of each. What a character controller moves by: a
+  shape it starts touching stops it only when it moves into it, so a floor
+  under it lets it walk and a wall beside it lets it step away; a one-way
+  shape stops it only coming the way it holds; and `options.ignore` passes
+  over its own body. Found by the same conservative advancement the sweep of
+  fast bodies uses.
 
 ## Filtering
 
@@ -380,8 +396,8 @@ Each of these is a known piece of work, listed with what it would take.
   body is not swept. A thin rod already pressed deep into a wall by a pile
   hammering it from behind can still be shoved through: of three hundred
   thin rods fired into a heap against a wall at 30-150 m/s, two.
-- **Capsules and rounded polygons.** Each is a row and a column of the narrow
-  phase's pairings. A capsule is what a character controller wants.
+- **Rounded polygons of more than two corners.** The pairing is there -
+  a capsule is one - and a shape to make one of is not.
 - **Rolling resistance.** A ball on a slope rolls for ever, so a heap with
   balls in it never quite comes to rest and never sleeps. Box2D v3 adds a
   small torque against rolling for this.

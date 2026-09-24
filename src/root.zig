@@ -74,6 +74,7 @@ pub const BodyDef = Body.Def;
 pub const Shape = shape.Shape;
 pub const Circle = shape.Circle;
 pub const Polygon = shape.Polygon;
+pub const Capsule = shape.Capsule;
 pub const Material = shape.Material;
 pub const Filter = shape.Filter;
 pub const FilterRule = shape.FilterRule;
@@ -97,6 +98,9 @@ pub const Softness = @import("Softness.zig");
 pub const Settings = World.Settings;
 pub const ContactEvent = World.ContactEvent;
 pub const RayHit = World.RayHit;
+pub const ShapeHit = World.ShapeHit;
+pub const CastOptions = World.CastOptions;
+pub const Overlap = World.Overlap;
 pub const Manifold = collide.Manifold;
 
 pub const Vec2 = geometry.Vec2;

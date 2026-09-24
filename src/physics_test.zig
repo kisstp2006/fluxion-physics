@@ -902,3 +902,86 @@ test "the sweep lets a fast body through a one-way floor's side, and past one it
         try testing.expectApproxEqAbs(@as(f32, 28), world.body(plank).?.position().x, 1e-3);
     }
 }
+
+test "a shape cast stops short of a wall, slides free along the floor it stands on, and goes into it at nought" {
+    var scene = try floored();
+    var world = &scene.world;
+    defer world.deinit();
+    // A wall standing on the floor at x = 3, its left face at 2.5.
+    const wall = try world.createBody(.{ .type = .static, .position = .init(3, -1) });
+    _ = try world.addShape(wall, .box(0.5, 1.5));
+
+    const margin: f32 = 0.01;
+    const options: World.CastOptions = .{ .margin = margin };
+    for ([_]physics.shape.Geometry{
+        .{ .circle = .{ .radius = 0.5 } },
+        .{ .capsule = .{ .center1 = .init(0, -0.25), .center2 = .init(0, 0.25), .radius = 0.25 } },
+    }) |g| {
+        // Resting on the floor, a margin clear of it.
+        const bottom: f32 = switch (g) {
+            .circle => 0.5,
+            .capsule => 0.5,
+            .polygon => unreachable,
+        };
+        const at: physics.Transform = .init(.init(0, -bottom - margin), 0);
+
+        // Along the floor: free until the wall, and stopped a margin short.
+        const hit = world.castShape(&g, at, .init(5, 0), options).?;
+        try testing.expect(std.meta.eql(hit.body, wall));
+        try testing.expect(hit.normal.approxEql(.init(-1, 0)));
+        const reach: f32 = switch (g) {
+            .circle => 0.5,
+            .capsule => 0.25,
+            .polygon => unreachable,
+        };
+        try testing.expectApproxEqAbs((2.5 - reach - margin) / 5, hit.fraction, 0.002);
+
+        // Down, into the floor it stands on: stopped where it is.
+        const down = world.castShape(&g, at, .init(0, 1), options).?;
+        try testing.expect(std.meta.eql(down.body, scene.floor));
+        try testing.expectEqual(@as(f32, 0), down.fraction);
+        try testing.expect(down.normal.approxEql(.init(0, -1)));
+
+        // Up, away from it: nothing.
+        try testing.expect(world.castShape(&g, at, .init(0, -1), options) == null);
+    }
+}
+
+test "a shape sunk into the floor is told the way out, and a one-way platform lets a cast up through it" {
+    var scene = try floored();
+    var world = &scene.world;
+    defer world.deinit();
+
+    const ball: physics.shape.Geometry = .{ .circle = .{ .radius = 0.5 } };
+    var found: [4]World.Overlap = undefined;
+    const sunk = world.overlapShape(&ball, .init(.init(0, 0.1 - 0.5), 0), .{ .margin = 0.01 }, &found);
+    try testing.expectEqual(@as(usize, 1), sunk.len);
+    try testing.expect(sunk[0].normal.approxEql(.init(0, -1)));
+    try testing.expectApproxEqAbs(@as(f32, 0.11), sunk[0].depth, 1e-4);
+
+    // Its own body is passed over.
+    const own = try world.createBody(.{ .type = .kinematic, .position = .init(0, -3) });
+    _ = try world.addShape(own, .circle(0.5));
+    try testing.expect(world.castShape(&ball, .init(.init(0, -5), 0), .init(0, 3), .{ .ignore = own }) == null);
+    try testing.expect(world.castShape(&ball, .init(.init(0, -5), 0), .init(0, 3), .{}) != null);
+
+    // A platform held from above.
+    const platform = try world.createBody(.{ .type = .static, .position = .init(10, -2) });
+    _ = try world.addShape(platform, .{ .geometry = .{ .polygon = .box(1, 0.1) }, .one_way = .{} });
+    try testing.expect(world.castShape(&ball, .init(.init(10, -1), 0), .init(0, -3), .{}) == null);
+    const landed = world.castShape(&ball, .init(.init(10, -4), 0), .init(0, 3), .{}).?;
+    try testing.expect(std.meta.eql(landed.body, platform));
+}
+
+test "a capsule falls onto the floor and stands on it" {
+    var scene = try floored();
+    var world = &scene.world;
+    defer world.deinit();
+    var jobs: Jobs = try .init(gpa, .{ .io = null });
+    defer jobs.deinit();
+    const person = try world.createBody(.{ .position = .init(0, -2), .fixed_rotation = true });
+    _ = try world.addShape(person, .capsule(.init(0, -0.25), .init(0, 0.25), 0.25));
+    try steps(world, &jobs, 180);
+    // Its bottom, half a metre below its middle, on y = 0.
+    try testing.expectApproxEqAbs(@as(f32, -0.5), world.body(person).?.position().y, 0.01);
+}

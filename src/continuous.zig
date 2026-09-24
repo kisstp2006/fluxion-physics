@@ -102,15 +102,38 @@ pub const Separation = struct {
 /// overlap, the depth along the shallowest way out - the separating-axis
 /// answer, the narrow phase's too.
 pub fn separation(a: *const Geometry, xa: Transform, b: *const Geometry, xb: Transform) Separation {
+    // A capsule is its core with its radius round it: the gap to its core,
+    // less the radius.
+    switch (a.*) {
+        .capsule => |c| {
+            const inner: Geometry = .{ .polygon = c.core() };
+            var s = separation(&inner, xa, b, xb);
+            s.distance -= c.radius;
+            return s;
+        },
+        else => {},
+    }
+    switch (b.*) {
+        .capsule => |c| {
+            const inner: Geometry = .{ .polygon = c.core() };
+            var s = separation(a, xa, &inner, xb);
+            s.distance -= c.radius;
+            return s;
+        },
+        else => {},
+    }
     return switch (a.*) {
         .circle => |ca| switch (b.*) {
             .circle => |cb| circles(ca, xa, cb, xb),
             .polygon => |*pb| flipped(polygonCircle(pb, xb, ca, xa)),
+            .capsule => unreachable,
         },
         .polygon => |*pa| switch (b.*) {
             .circle => |cb| polygonCircle(pa, xa, cb, xb),
             .polygon => |*pb| polygons(pa, xa, pb, xb),
+            .capsule => unreachable,
         },
+        .capsule => unreachable,
     };
 }
 
