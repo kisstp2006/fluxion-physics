@@ -531,6 +531,9 @@ test "rays and points find what is there" {
     try testing.expect(world.castRay(.zero, .init(10, 0), .{}).?.shape.eql(near_shape));
     try testing.expect(world.castRay(.zero, .init(10, 0), .{ .sensors = true }).?.shape.eql(trigger_shape));
 
+    // The body a ray is cast from is not what it hits.
+    try testing.expect(world.castRay(.zero, .init(10, 0), .{ .ignore = near }).?.shape.eql(far_shape));
+
     try testing.expect(world.overlapPoint(.init(3.2, 0.2)).?.eql(near_shape));
     try testing.expect(world.overlapPoint(.init(6.5, 0.5)).?.eql(far_shape));
     try testing.expect(world.overlapPoint(.init(4.5, 0)) == null);

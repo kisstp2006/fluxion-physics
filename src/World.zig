@@ -2032,6 +2032,8 @@ pub const RayOptions = struct {
     /// Whether it sees sensors too: a trigger it passes through is not
     /// what it hits, unless it asks.
     sensors: bool = false,
+    /// A body whose shapes are passed over: the one the ray is cast from.
+    ignore: ?BodyId = null,
 };
 
 /// The first thing a ray hits, from `origin` along `translation`, among
@@ -2091,6 +2093,7 @@ const RayCast = struct {
         const world = self.world;
         const entry = &world.shapes.slots.items[index].value.?;
         if (entry.def.sensor and !self.options.sensors) return -1;
+        if (self.options.ignore) |own| if (std.meta.eql(own, entry.body)) return -1;
         if (!self.options.filter.shouldCollide(entry.def.filter)) return -1;
         const xf = world.bodyAt(entry.body_index).transform;
         const hit = rayAgainst(&entry.def.geometry, xf, self.origin, self.translation, max_fraction) orelse return -1;
