@@ -2024,15 +2024,25 @@ pub fn colourCount(self: *const World) usize {
 // Queries
 // -------------------------------------------------------------------------
 
+/// What a ray asks.
+pub const RayOptions = struct {
+    /// The shapes whose filter agrees with this one's, each one's mask
+    /// having the other's category.
+    filter: Filter = .{},
+    /// Whether it sees sensors too: a trigger it passes through is not
+    /// what it hits, unless it asks.
+    sensors: bool = false,
+};
+
 /// The first thing a ray hits, from `origin` along `translation`, among
-/// shapes whose filter agrees with `filter`. Null if nothing.
+/// the shapes `options` asks for. Null if nothing.
 ///
 /// The shapes that move are asked one by one - there are few beside a
 /// level - and the ray is shortened to the nearest of them; then the
 /// level's tree is walked with what is left, and only the branches that
 /// ray crosses are looked at. Logarithmic in the level.
-pub fn castRay(self: *World, origin: Vec2, translation: Vec2, filter: Filter) ?RayHit {
-    var cast: RayCast = .{ .world = self, .origin = origin, .translation = translation, .filter = filter };
+pub fn castRay(self: *World, origin: Vec2, translation: Vec2, options: RayOptions) ?RayHit {
+    var cast: RayCast = .{ .world = self, .origin = origin, .translation = translation, .options = options };
     for (self.sweep.order.items) |index| {
         const b = self.bodyAt(self.shapes.slots.items[index].value.?.body_index);
         if (!rayNears(b, origin, translation, cast.fraction)) continue;
@@ -2069,7 +2079,7 @@ const RayCast = struct {
     world: *World,
     origin: Vec2,
     translation: Vec2,
-    filter: Filter,
+    options: RayOptions,
     /// How far along the nearest hit so far is: where the ray now stops.
     fraction: f32 = 1,
     best: ?RayHit = null,
@@ -2080,7 +2090,8 @@ const RayCast = struct {
     fn consider(self: *RayCast, index: u32, max_fraction: f32) f32 {
         const world = self.world;
         const entry = &world.shapes.slots.items[index].value.?;
-        if (!self.filter.shouldCollide(entry.def.filter)) return -1;
+        if (entry.def.sensor and !self.options.sensors) return -1;
+        if (!self.options.filter.shouldCollide(entry.def.filter)) return -1;
         const xf = world.bodyAt(entry.body_index).transform;
         const hit = rayAgainst(&entry.def.geometry, xf, self.origin, self.translation, max_fraction) orelse return -1;
         self.fraction = hit.fraction;

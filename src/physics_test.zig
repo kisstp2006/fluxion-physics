@@ -512,7 +512,7 @@ test "rays and points find what is there" {
     try testing.expect(hit.normal.approxEql(.init(-1, 0)));
 
     // A ray that only sees category 2 skips the box and finds the circle.
-    const through = world.castRay(.zero, .init(10, 0), .{ .mask = 2 }).?;
+    const through = world.castRay(.zero, .init(10, 0), .{ .filter = .{ .mask = 2 } }).?;
     try testing.expect(through.shape.eql(far_shape));
     try testing.expectApproxEqAbs(@as(f32, 0.5), through.fraction, 1e-5);
     try testing.expect(through.normal.approxEql(.init(-1, 0)));
@@ -524,6 +524,12 @@ test "rays and points find what is there" {
     // A ray starting inside the box has no entry face and misses it.
     const from_inside = world.castRay(.init(3, 0), .init(10, 0), .{}).?;
     try testing.expect(from_inside.shape.eql(far_shape));
+
+    // A sensor in the way is passed through, unless the ray asks for them.
+    const trigger = try world.createBody(.{ .type = .static, .position = .init(1, 0) });
+    const trigger_shape = try world.addShape(trigger, .{ .geometry = .{ .circle = .{ .radius = 0.25 } }, .sensor = true });
+    try testing.expect(world.castRay(.zero, .init(10, 0), .{}).?.shape.eql(near_shape));
+    try testing.expect(world.castRay(.zero, .init(10, 0), .{ .sensors = true }).?.shape.eql(trigger_shape));
 
     try testing.expect(world.overlapPoint(.init(3.2, 0.2)).?.eql(near_shape));
     try testing.expect(world.overlapPoint(.init(6.5, 0.5)).?.eql(far_shape));

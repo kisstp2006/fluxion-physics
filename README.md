@@ -326,7 +326,8 @@ allocator and arithmetic.
   a kinematic body, another sensor - and goes on seeing what stands still in
   it; only two static shapes never meet. A sleeping contact is still
   touching, and ends nothing.
-- **Queries**, between steps: `castRay` for the first thing along a line,
+- **Queries**, between steps: `castRay` for the first thing along a line
+  - past sensors, unless its `RayOptions` ask for them -
   `overlapPoint` for what is under the mouse, `overlapAabb` for everything in
   a box. The level answers from its tree; the shapes that move are asked one
   by one, after a circle round each body has turned most of them away.
