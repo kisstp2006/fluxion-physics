@@ -98,6 +98,7 @@ pub const Softness = @import("Softness.zig");
 pub const Settings = World.Settings;
 pub const ContactEvent = World.ContactEvent;
 pub const RayHit = World.RayHit;
+pub const RayOptions = World.RayOptions;
 pub const ShapeHit = World.ShapeHit;
 pub const CastOptions = World.CastOptions;
 pub const Overlap = World.Overlap;
