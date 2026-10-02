@@ -132,6 +132,7 @@ fn draw(gpa: std.mem.Allocator, world: *World) ![]const u8 {
         const glyph: u8 = if (body.type == .static) '=' else switch (entry.value.def.geometry) {
             .circle => 'o',
             .polygon => '#',
+            .capsule => '0',
         };
         // Twelve metres across the width, y down, and a step of a third
         // of a metre per cell so nothing but a wall fills more than one.
